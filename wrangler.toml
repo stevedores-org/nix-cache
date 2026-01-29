@@ -1,0 +1,23 @@
+name = "nix-cache"
+main = "src/index.ts"
+compatibility_date = "2024-04-01"
+
+# Custom domain configuration
+[[routes]]
+pattern = "nix-cache.stevedores.org/*"
+zone_name = "stevedores.org"
+
+[observability]
+enabled = false
+
+[observability.logs]
+enabled = false
+invocation_logs = true
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "nix-cache"
+
+[vars]
+# Optional: Set this to a public key to verify NAR signatures if proxying/serving
+# NIX_PUBLIC_KEY = ""
