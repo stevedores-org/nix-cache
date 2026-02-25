@@ -1,23 +1,41 @@
 name = "nix-cache"
 main = "src/index.ts"
-compatibility_date = "2024-04-01"
+compatibility_date = "2026-02-22"
+account_id = "f1be33af27cf878e2e81cb29a0d886f7"
+workers_dev = true
 
-# Custom domain configuration
+# ── Custom domain ────────────────────────────────────────────────
 [[routes]]
 pattern = "nix-cache.stevedores.org/*"
 zone_name = "stevedores.org"
 
+# NOTE: Cloudflare Workers Builds (GitHub integration) does NOT honor this
+# [build] section. The build command must be set in the CF dashboard:
+#   Settings > Build > Build command: bun install && bunx tsc --noEmit
+#   Settings > Build > Deploy command: bunx wrangler@3 deploy
+[build]
+command = "bun install && bunx tsc --noEmit"
+
+# deploy: bunx wrangler@3 deploy
+# dev:    bunx wrangler@3 dev
+
+# ── Observability ────────────────────────────────────────────────
 [observability]
-enabled = false
+enabled = true
 
 [observability.logs]
-enabled = false
+enabled = true
 invocation_logs = true
 
+# ── Environment variables ────────────────────────────────────────
+[vars]
+APP_ENV = "production"
+SERVICE_NAME = "nix-cache"
+# Secrets (set via `wrangler secret put`):
+#   CACHE_AUTH_TOKEN — bearer token required for PUT uploads
+
+# ── R2: Nix binary cache storage (.narinfo, .nar) ───────────────
+# Create bucket: wrangler r2 bucket create nix-cache
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "nix-cache"
-
-[vars]
-# Optional: Set this to a public key to verify NAR signatures if proxying/serving
-# NIX_PUBLIC_KEY = ""
