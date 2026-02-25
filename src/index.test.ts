@@ -29,9 +29,20 @@ function makeBucket() {
   };
 }
 
+// In-memory KV stub
+function makeKV() {
+  const store = new Map<string, string>();
+  return {
+    store,
+    async get(key: string) { return store.get(key) || null; },
+    async put(key: string, value: string) { store.set(key, value); },
+  };
+}
+
 function makeEnv(token = "test-secret-token") {
   return {
     BUCKET: makeBucket() as unknown as R2Bucket,
+    METRICS: makeKV() as unknown as KVNamespace,
     CACHE_AUTH_TOKEN: token,
   };
 }
@@ -185,6 +196,50 @@ describe("nix-cache worker", () => {
         badEnv,
       );
       expect(res.status).toBe(500);
+    });
+  });
+
+  describe("GET /metrics", () => {
+    it("rejects unauthenticated requests", async () => {
+      const res = await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/metrics"),
+        env,
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it("returns counters after activity", async () => {
+      // Generate some activity: 1 hit, 1 miss, 1 put, 1 auth fail
+      await worker.fetch(new Request("https://nix-cache.stevedores.org/miss.narinfo"), env);
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/obj", {
+          method: "PUT", body: "data",
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+      await worker.fetch(new Request("https://nix-cache.stevedores.org/obj"), env);
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/obj", {
+          method: "PUT", body: "x",
+          headers: { Authorization: "Bearer bad" },
+        }),
+        env,
+      );
+
+      const res = await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/metrics", {
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      const json = await res.json() as Record<string, number>;
+      expect(json.get_hit).toBe(1);
+      expect(json.get_miss).toBe(1);
+      expect(json.put_ok).toBe(1);
+      expect(json.auth_fail).toBe(1);
+      expect(json.get_total).toBe(2);
     });
   });
 });
