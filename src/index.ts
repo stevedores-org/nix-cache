@@ -1,12 +1,21 @@
 /**
  * Nix Binary Cache Worker for Cloudflare R2
  *
- * This worker implements a Nix-compatible binary cache backed by Cloudflare R2.
- * It serves .narinfo and .nar files.
+ * Implements a Nix-compatible binary cache backed by Cloudflare R2.
+ * GET is public (serves .narinfo and .nar files).
+ * PUT requires Bearer token authentication.
  */
 
 export interface Env {
   BUCKET: R2Bucket;
+  CACHE_AUTH_TOKEN: string;
+}
+
+function jsonError(message: string, status: number): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 export default {
@@ -14,7 +23,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Nix cache health check
+    // Nix cache info
     if (path === "/" || path === "/nix-cache-info") {
       return new Response(
         "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n",
@@ -24,7 +33,7 @@ export default {
       );
     }
 
-    // Health check for status monitoring
+    // Health check
     if (path === "/health") {
       return new Response(JSON.stringify({
         status: "ok",
@@ -35,7 +44,7 @@ export default {
       });
     }
 
-    // GET requests - serve from R2
+    // GET — public, serve from R2
     if (request.method === "GET") {
       const objectName = path.startsWith("/") ? path.slice(1) : path;
       const object = await env.BUCKET.get(objectName);
@@ -48,24 +57,33 @@ export default {
       object.writeHttpMetadata(headers);
       headers.set("etag", object.httpEtag);
 
-      // Set correct content types for Nix files
       if (path.endsWith(".narinfo")) {
         headers.set("Content-Type", "text/x-nix-narinfo");
       } else if (path.endsWith(".nar") || path.includes("/nar/")) {
         headers.set("Content-Type", "application/x-nix-archive");
       }
 
-      return new Response(object.body, {
-        headers,
-      });
+      return new Response(object.body, { headers });
     }
 
-    // PUT requests - upload to R2 (requires secret/token validation in production)
+    // PUT — requires Bearer token
     if (request.method === "PUT") {
-      // Basic auth or token validation should be added here
+      if (!env.CACHE_AUTH_TOKEN) {
+        return jsonError("Server misconfigured: no auth token set", 500);
+      }
+
       const authHeader = request.headers.get("Authorization");
       if (!authHeader) {
-        return new Response("Unauthorized", { status: 401 });
+        return jsonError("Missing Authorization header", 401);
+      }
+
+      const [scheme, token] = authHeader.split(" ", 2);
+      if (scheme !== "Bearer" || !token) {
+        return jsonError("Authorization must use Bearer scheme", 401);
+      }
+
+      if (token !== env.CACHE_AUTH_TOKEN) {
+        return jsonError("Invalid token", 403);
       }
 
       const objectName = path.startsWith("/") ? path.slice(1) : path;
@@ -76,6 +94,6 @@ export default {
       return new Response("OK", { status: 201 });
     }
 
-    return new Response("Method not allowed", { status: 405 });
+    return jsonError("Method not allowed", 405);
   },
 };
