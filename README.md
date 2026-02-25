@@ -6,7 +6,9 @@ Nix binary cache Cloudflare Worker backed by R2 storage.
 
 ## What is this?
 
-A Nix-compatible binary cache that serves pre-built Nix packages. Instead of building everything from source, Nix can download pre-built binaries from this cache.
+A **plain Nix binary cache** (not [Attic](https://github.com/zhaofengli/attic)) backed by Cloudflare R2. It implements the standard Nix binary cache protocol — `nix-cache-info`, `.narinfo`, and `.nar` files served over HTTPS.
+
+**This is NOT an Attic server.** Use `nix copy --to` for uploads, not `attic push`. The `attic-client` package is not needed.
 
 ## Architecture
 
@@ -79,15 +81,24 @@ Or in a CI pipeline:
 
 ## Pushing to the Cache
 
-Upload pre-built packages after CI builds:
+Upload pre-built packages after CI builds using `nix copy` (the standard Nix protocol):
 
 ```bash
 # Sign and upload a store path
 nix store sign --key-file /path/to/secret-key /nix/store/abc123-mypackage
-nix copy --to "https://nix-cache.stevedores.org" /nix/store/abc123-mypackage
+nix copy --to "http://nix-cache.stevedores.org?secret-key=/path/to/secret-key" /nix/store/abc123-mypackage
 ```
 
-**Note:** PUT requests require `Authorization` header.
+In CI (using org secrets):
+```bash
+echo "$NIX_SIGNING_SECRET_KEY" > /tmp/nix-sign-key
+nix copy --to "http://nix-cache.stevedores.org?secret-key=/tmp/nix-sign-key" .#packages.x86_64-linux.default
+```
+
+**Note:** PUT requests require `Authorization: Bearer <CACHE_AUTH_TOKEN>` header.
+
+> **Do NOT use `attic push`** — this is a plain binary cache, not an Attic server.
+> The `attic-client` devShell dependency can be removed from consuming repos.
 
 ## API Endpoints
 
