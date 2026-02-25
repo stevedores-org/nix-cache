@@ -12,99 +12,52 @@ A **plain Nix binary cache** (not [Attic](https://github.com/zhaofengli/attic)) 
 
 ## Architecture
 
-```
-┌─────────────┐     ┌─────────────────────┐     ┌──────────┐
-│  Nix Client │────▶│  Cloudflare Worker  │────▶│  R2 Bucket│
-└─────────────┘     └─────────────────────┘     └──────────┘
-                    nix-cache.stevedores.org     nix-cache
-```
+```mermaid
+flowchart LR
+    subgraph Clients
+        Dev[Developer Machine]
+        CI[GitHub Actions CI]
+    end
 
-- **Worker**: Routes requests, sets correct MIME types
-- **R2**: Stores `.narinfo` (metadata) and `.nar` (archives) files
+    subgraph Cloudflare
+        W[Worker<br>nix-cache.stevedores.org]
+        R2[(R2 Bucket<br>nix-cache)]
+        KV[(KV<br>METRICS)]
+    end
 
-## Usage
-
-### Add to your Nix configuration
-
-**NixOS** (`/etc/nixos/configuration.nix`):
-```nix
-{
-  nix.settings = {
-    substituters = [
-      "https://cache.nixos.org"
-      "https://nix-cache.stevedores.org"
-    ];
-    trusted-public-keys = [
-      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-      "stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag="
-    ];
-  };
-}
+    Dev -- "GET .narinfo/.nar" --> W
+    CI -- "GET .narinfo/.nar" --> W
+    CI -- "PUT .narinfo/.nar<br>(Bearer auth)" --> W
+    W -- "read/write" --> R2
+    W -- "incr counters" --> KV
 ```
 
-**Flakes** (`flake.nix`):
+**Data flow:**
+- **GET** (public): Nix client requests `.narinfo`/`.nar` → Worker fetches from R2 → returns to client
+- **PUT** (authenticated): CI signs store paths → `nix copy --to` uploads to Worker → Worker stores in R2
+- **Metrics**: Every request increments KV counters → `/metrics` endpoint returns JSON
+
+## Quick Start for New Repos
+
+Add this to your `flake.nix`:
 ```nix
 {
   nixConfig = {
     extra-substituters = [ "https://nix-cache.stevedores.org" ];
     extra-trusted-public-keys = [ "stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag=" ];
   };
+
+  # ... rest of your flake
 }
 ```
 
-**Command line**:
-```bash
-nix build --substituters "https://cache.nixos.org https://nix-cache.stevedores.org" .#package
-```
+That's it — Nix will now pull cached builds from `nix-cache.stevedores.org`.
 
-### For OCI/Container Builds
+## CI Integration
 
-When building container images with Nix:
+### Reusable GitHub Actions
 
-```bash
-# Build with custom cache
-nix build .#dockerImage \
-  --substituters "https://cache.nixos.org https://nix-cache.stevedores.org"
-
-# Load into Docker
-docker load < result
-```
-
-Or in a CI pipeline:
-```yaml
-- name: Build container
-  run: |
-    nix build .#dockerImage \
-      --substituters "https://cache.nixos.org https://nix-cache.stevedores.org" \
-      --trusted-public-keys "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag="
-```
-
-## Pushing to the Cache
-
-Upload pre-built packages after CI builds using `nix copy` (the standard Nix protocol):
-
-```bash
-# Sign and upload a store path
-nix store sign --key-file /path/to/secret-key /nix/store/abc123-mypackage
-nix copy --to "http://nix-cache.stevedores.org?secret-key=/path/to/secret-key" /nix/store/abc123-mypackage
-```
-
-In CI (using org secrets):
-```bash
-echo "$NIX_SIGNING_SECRET_KEY" > /tmp/nix-sign-key
-nix copy --to "http://nix-cache.stevedores.org?secret-key=/tmp/nix-sign-key" .#packages.x86_64-linux.default
-```
-
-**Note:** PUT requests require `Authorization: Bearer <CACHE_AUTH_TOKEN>` header.
-
-> **Do NOT use `attic push`** — this is a plain binary cache, not an Attic server.
-> The `attic-client` devShell dependency can be removed from consuming repos.
-
-## Reusable GitHub Actions
-
-This repo provides composite actions for CI integration.
-
-### Setup (pull from cache)
+This repo provides composite actions. Add to your workflow:
 
 ```yaml
 jobs:
@@ -120,14 +73,13 @@ jobs:
 
       - run: nix flake check
 
-      # Push build results (only on merge, when push=true was set)
       - uses: stevedores-org/nix-cache/.github/actions/push@develop
         if: github.event_name == 'push'
         with:
           paths: .#default
 ```
 
-### Inputs
+### Action Inputs
 
 | Input | Required | Description |
 |-------|----------|-------------|
@@ -135,49 +87,129 @@ jobs:
 | `cache-auth-token` | If push | Bearer token for PUT auth |
 | `signing-secret-key` | If push | Ed25519 secret key for signing |
 
-All secrets are available as `stevedores-org` org-level secrets.
+### Manual CI Setup
+
+If not using the composite actions:
+```bash
+echo "$NIX_SIGNING_SECRET_KEY" > /tmp/nix-sign-key
+nix store sign --key-file /tmp/nix-sign-key $(nix build .#default --no-link --print-out-paths)
+nix copy --to "https://nix-cache.stevedores.org" $(nix build .#default --no-link --print-out-paths)
+```
+
+## Secrets Reference
+
+All secrets are stored at **org level** (`stevedores-org` GitHub org settings) and as Cloudflare Worker secrets.
+
+| Secret | Where | Purpose |
+|--------|-------|---------|
+| `CACHE_AUTH_TOKEN` | GH org + CF Worker | Bearer token for PUT uploads |
+| `NIX_SIGNING_SECRET_KEY` | GH org | Ed25519 secret key for signing store paths |
+| `NIX_SIGNING_PUBLIC_KEY` | GH org | Public key for reference in CI |
+
+**Public key** (safe to share): `stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag=`
+
+## Pushing to the Cache
+
+Upload pre-built packages using `nix copy` (the standard Nix protocol):
+
+```bash
+# From a developer machine
+nix store sign --key-file /path/to/secret-key /nix/store/abc123-mypackage
+nix copy --to "https://nix-cache.stevedores.org" /nix/store/abc123-mypackage
+```
+
+> **Do NOT use `attic push`** — this is a plain binary cache, not an Attic server.
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Cache info |
-| `/nix-cache-info` | GET | Cache info |
-| `/health` | GET | Health check (JSON) |
-| `/<hash>.narinfo` | GET | Package metadata |
-| `/nar/<hash>.nar` | GET | Package archive |
-| `/*` | PUT | Upload (requires auth) |
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/` | GET | No | Cache info (`nix-cache-info` format) |
+| `/nix-cache-info` | GET | No | Cache info |
+| `/health` | GET | No | Health check (JSON) |
+| `/metrics` | GET | Bearer | JSON counters (hits, misses, uploads, auth failures) |
+| `/<hash>.narinfo` | GET | No | Package metadata |
+| `/nar/<hash>.nar` | GET | No | Package archive |
+| `/*` | PUT | Bearer | Upload to R2 |
+
+## Monitoring
+
+### Metrics Endpoint
+
+```bash
+curl -H "Authorization: Bearer $CACHE_AUTH_TOKEN" https://nix-cache.stevedores.org/metrics
+```
+
+Returns:
+```json
+{
+  "get_hit": 142,
+  "get_miss": 23,
+  "put_ok": 87,
+  "auth_fail": 2,
+  "get_total": 165
+}
+```
+
+### Cloudflare Dashboard
+
+- **Worker analytics**: Requests, errors, latency — [CF Dashboard > Workers > nix-cache](https://dash.cloudflare.com/f1be33af27cf878e2e81cb29a0d886f7/workers/services/view/nix-cache/production)
+- **R2 storage**: Object count, storage usage — [CF Dashboard > R2 > nix-cache](https://dash.cloudflare.com/f1be33af27cf878e2e81cb29a0d886f7/r2/default/buckets/nix-cache)
+- **Observability logs**: Enabled in `wrangler.toml` — visible in CF dashboard under Workers > Logs
 
 ## Development
 
 ```bash
-# Install deps
-bun install
-
-# Run locally
-bunx wrangler dev
-
-# Deploy
-bunx wrangler deploy
+bun install          # Install deps
+bun test             # Run 13 integration tests
+bunx tsc --noEmit    # Type check
+bunx wrangler dev    # Run locally
 ```
 
-## Cloudflare Setup
+Deployment is automatic via Cloudflare Workers Builds — pushes to `main` trigger deploys.
 
-1. Create R2 bucket named `nix-cache`
-2. Add custom domain `nix-cache.stevedores.org`
-3. Deploy worker with `wrangler deploy`
+## Cloudflare Resources
 
-## Signing Key
+| Resource | Type | Purpose |
+|----------|------|---------|
+| `nix-cache` | Worker | Request routing, auth, metrics |
+| `nix-cache` | R2 bucket | `.narinfo` + `.nar` storage |
+| `METRICS` | KV namespace | Counter storage |
+| `CACHE_AUTH_TOKEN` | Worker secret | PUT authentication |
 
-**Public key:** `stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag=`
+## Key Rotation
 
-The secret key is stored as `NIX_SIGNING_SECRET_KEY` in the `stevedores-org` GitHub org secrets.
-
-To rotate the key:
 ```bash
+# Generate new keypair
 nix-store --generate-binary-cache-key stevedores-cache-2 /path/to/secret /path/to/public
-# Update org secret NIX_SIGNING_SECRET_KEY and NIX_SIGNING_PUBLIC_KEY
-# Update this README and all consuming flake.nix files
+
+# Update everywhere:
+# 1. GitHub org secrets: NIX_SIGNING_SECRET_KEY, NIX_SIGNING_PUBLIC_KEY
+# 2. This README (public key references)
+# 3. wrangler.toml NIX_PUBLIC_KEY var
+# 4. All consuming flake.nix files (extra-trusted-public-keys)
+```
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `nix build` ignores cache, builds from source | Missing `extra-trusted-public-keys` in `flake.nix` | Add the public key (see Quick Start) |
+| `warning: ignoring substitute` | Public key mismatch or missing | Verify key matches `stevedores-cache-1:bXLx...` |
+| 404 on `.narinfo` | Store path not cached yet | Push it from CI or manually |
+| 401 on PUT | Missing or wrong `Authorization` header | Use `Bearer <CACHE_AUTH_TOKEN>` |
+| 403 on PUT | Invalid token | Check `CACHE_AUTH_TOKEN` matches CF Worker secret |
+| 500 on PUT | `CACHE_AUTH_TOKEN` not set on Worker | Set it via `wrangler versions secret put` |
+
+## Disaster Recovery
+
+If R2 data is lost, the cache can be repopulated by re-running CI builds on all repos. The cache is a **performance optimization**, not a source of truth — all packages can be rebuilt from source.
+
+```bash
+# Trigger rebuilds across all repos
+for repo in oxidizedMLX aivcs oxidizedRAG local-ci; do
+  gh workflow run ci.yml --repo "stevedores-org/$repo"
+done
 ```
 
 ## License
