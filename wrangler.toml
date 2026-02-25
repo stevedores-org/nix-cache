@@ -31,8 +31,10 @@ invocation_logs = true
 [vars]
 APP_ENV = "production"
 SERVICE_NAME = "nix-cache"
-# Secrets (set via `wrangler secret put`):
-#   CACHE_AUTH_TOKEN — bearer token required for PUT uploads
+NIX_PUBLIC_KEY = "stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag="
+# Secrets (set via `wrangler secret put` or CF dashboard):
+#   CACHE_AUTH_TOKEN        — bearer token required for PUT uploads
+#   NIX_SIGNING_SECRET_KEY  — Ed25519 secret key for signing narinfo (org-level GH secret)
 
 # ── R2: Nix binary cache storage (.narinfo, .nar) ───────────────
 # Create bucket: wrangler r2 bucket create nix-cache
