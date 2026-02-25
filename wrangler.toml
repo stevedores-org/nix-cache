@@ -36,6 +36,13 @@ NIX_PUBLIC_KEY = "stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag
 #   CACHE_AUTH_TOKEN        — bearer token required for PUT uploads
 #   NIX_SIGNING_SECRET_KEY  — Ed25519 secret key for signing narinfo (org-level GH secret)
 
+# ── KV: metrics counters ─────────────────────────────────────────
+# Create namespace: bunx wrangler kv namespace create METRICS
+# The id below must be updated after creation.
+[[kv_namespaces]]
+binding = "METRICS"
+id = "3c8a120b5544498986a497e7da47b1ea"
+
 # ── R2: Nix binary cache storage (.narinfo, .nar) ───────────────
 # Create bucket: wrangler r2 bucket create nix-cache
 [[r2_buckets]]
