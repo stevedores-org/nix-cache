@@ -34,7 +34,7 @@ A Nix-compatible binary cache that serves pre-built Nix packages. Instead of bui
     ];
     trusted-public-keys = [
       "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-      # Add your cache's public key here
+      "stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag="
     ];
   };
 }
@@ -45,7 +45,7 @@ A Nix-compatible binary cache that serves pre-built Nix packages. Instead of bui
 {
   nixConfig = {
     extra-substituters = [ "https://nix-cache.stevedores.org" ];
-    extra-trusted-public-keys = [ "your-key-here" ];
+    extra-trusted-public-keys = [ "stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag=" ];
   };
 }
 ```
@@ -74,7 +74,7 @@ Or in a CI pipeline:
   run: |
     nix build .#dockerImage \
       --substituters "https://cache.nixos.org https://nix-cache.stevedores.org" \
-      --trusted-public-keys "cache.nixos.org-1:... your-key:..."
+      --trusted-public-keys "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag="
 ```
 
 ## Pushing to the Cache
@@ -119,14 +119,17 @@ bunx wrangler deploy
 2. Add custom domain `nix-cache.stevedores.org`
 3. Deploy worker with `wrangler deploy`
 
-## Generating Cache Keys
+## Signing Key
 
+**Public key:** `stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag=`
+
+The secret key is stored as `NIX_SIGNING_SECRET_KEY` in the `stevedores-org` GitHub org secrets.
+
+To rotate the key:
 ```bash
-# Generate signing key pair
-nix-store --generate-binary-cache-key nix-cache.stevedores.org-1 secret-key public-key
-
-# secret-key: Keep safe, use for signing
-# public-key: Distribute to clients
+nix-store --generate-binary-cache-key stevedores-cache-2 /path/to/secret /path/to/public
+# Update org secret NIX_SIGNING_SECRET_KEY and NIX_SIGNING_PUBLIC_KEY
+# Update this README and all consuming flake.nix files
 ```
 
 ## License
