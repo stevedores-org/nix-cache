@@ -100,6 +100,43 @@ nix copy --to "http://nix-cache.stevedores.org?secret-key=/tmp/nix-sign-key" .#p
 > **Do NOT use `attic push`** — this is a plain binary cache, not an Attic server.
 > The `attic-client` devShell dependency can be removed from consuming repos.
 
+## Reusable GitHub Actions
+
+This repo provides composite actions for CI integration.
+
+### Setup (pull from cache)
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: stevedores-org/nix-cache/.github/actions/setup@develop
+        with:
+          push: ${{ github.event_name == 'push' }}
+          cache-auth-token: ${{ secrets.CACHE_AUTH_TOKEN }}
+          signing-secret-key: ${{ secrets.NIX_SIGNING_SECRET_KEY }}
+
+      - run: nix flake check
+
+      # Push build results (only on merge, when push=true was set)
+      - uses: stevedores-org/nix-cache/.github/actions/push@develop
+        if: github.event_name == 'push'
+        with:
+          paths: .#default
+```
+
+### Inputs
+
+| Input | Required | Description |
+|-------|----------|-------------|
+| `push` | No | Enable cache uploads (default: `false`) |
+| `cache-auth-token` | If push | Bearer token for PUT auth |
+| `signing-secret-key` | If push | Ed25519 secret key for signing |
+
+All secrets are available as `stevedores-org` org-level secrets.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |

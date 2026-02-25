@@ -1,0 +1,46 @@
+name: "Setup Nix Cache"
+description: "Install Nix, configure nix-cache.stevedores.org substituter, and optionally push build results"
+
+inputs:
+  push:
+    description: "Push build results to cache after build (default: false)"
+    required: false
+    default: "false"
+  cache-auth-token:
+    description: "Bearer token for PUT uploads (required if push=true)"
+    required: false
+  signing-secret-key:
+    description: "Ed25519 secret key for signing store paths (required if push=true)"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@v9
+      with:
+        extra-conf: |
+          substituters = https://cache.nixos.org https://nix-cache.stevedores.org
+          trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag=
+
+    - name: Setup signing key
+      if: inputs.push == 'true'
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.signing-secret-key }}" ]; then
+          echo "::error::signing-secret-key is required when push=true"
+          exit 1
+        fi
+        if [ -z "${{ inputs.cache-auth-token }}" ]; then
+          echo "::error::cache-auth-token is required when push=true"
+          exit 1
+        fi
+        echo "${{ inputs.signing-secret-key }}" > /tmp/nix-sign-key
+        chmod 600 /tmp/nix-sign-key
+
+    - name: Configure cache upload auth
+      if: inputs.push == 'true'
+      shell: bash
+      run: |
+        mkdir -p ~/.config/nix
+        echo "machine nix-cache.stevedores.org password ${{ inputs.cache-auth-token }}" >> ~/.config/nix/netrc
