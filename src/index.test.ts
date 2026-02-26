@@ -1,3 +1,5 @@
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "bun:test";
 
 // Minimal R2Object stub
@@ -404,5 +406,116 @@ describe("nix-cache worker", () => {
       expect(json.auth_fail).toBe(1);
       expect(json.get_total).toBe(2);
     });
+  });
+});
+
+// ── GitHub Actions composite action validation ──────────────────────
+
+const ROOT = join(import.meta.dir, "..");
+
+describe("GitHub Actions: setup action", () => {
+  const actionPath = join(ROOT, ".github/actions/setup/action.yml");
+
+  it("action.yml exists", () => {
+    expect(existsSync(actionPath)).toBe(true);
+  });
+
+  it("uses composite runner", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain('using: "composite"');
+  });
+
+  it("installs Nix via DeterminateSystems installer", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("DeterminateSystems/nix-installer-action");
+  });
+
+  it("configures stevedores substituter and public key", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("nix-cache.stevedores.org");
+    expect(content).toContain("stevedores-cache-1:");
+  });
+
+  it("declares push input with default false", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("push:");
+    expect(content).toContain('default: "false"');
+  });
+
+  it("declares cache-auth-token and signing-secret-key inputs", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("cache-auth-token:");
+    expect(content).toContain("signing-secret-key:");
+  });
+
+  it("sets up signing key only when push is true", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("inputs.push == 'true'");
+    expect(content).toContain("nix-sign-key");
+  });
+});
+
+describe("GitHub Actions: push action", () => {
+  const actionPath = join(ROOT, ".github/actions/push/action.yml");
+
+  it("action.yml exists", () => {
+    expect(existsSync(actionPath)).toBe(true);
+  });
+
+  it("uses composite runner", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain('using: "composite"');
+  });
+
+  it("declares paths input as required", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("paths:");
+    expect(content).toContain("required: true");
+  });
+
+  it("signs store paths with nix store sign", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("nix store sign");
+  });
+
+  it("copies to nix-cache.stevedores.org", () => {
+    const content = readFileSync(actionPath, "utf-8");
+    expect(content).toContain("nix copy --to");
+    expect(content).toContain("nix-cache.stevedores.org");
+  });
+});
+
+describe("GitHub Actions: CI workflow", () => {
+  const ciPath = join(ROOT, ".github/workflows/ci.yml");
+
+  it("ci.yml exists", () => {
+    expect(existsSync(ciPath)).toBe(true);
+  });
+
+  it("runs typecheck and test jobs", () => {
+    const content = readFileSync(ciPath, "utf-8");
+    expect(content).toContain("bun run typecheck");
+    expect(content).toContain("bun run test");
+  });
+
+  it("triggers on pull_request and push to develop/main", () => {
+    const content = readFileSync(ciPath, "utf-8");
+    expect(content).toContain("pull_request");
+    expect(content).toContain("develop");
+    expect(content).toContain("main");
+  });
+});
+
+describe("local-ci configuration", () => {
+  const lciPath = join(ROOT, ".lci.toml");
+
+  it(".lci.toml exists", () => {
+    expect(existsSync(lciPath)).toBe(true);
+  });
+
+  it("configures typecheck and test as default stages", () => {
+    const content = readFileSync(lciPath, "utf-8");
+    expect(content).toContain("typecheck");
+    expect(content).toContain("test");
   });
 });

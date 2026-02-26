@@ -161,9 +161,10 @@ Returns:
 
 ```bash
 bun install          # Install deps
-bun test             # Run 13 integration tests
+bun test             # Run integration tests
 bunx tsc --noEmit    # Type check
 bunx wrangler dev    # Run locally
+local-ci             # Run all CI checks locally (typecheck + test)
 ```
 
 Deployment is automatic via Cloudflare Workers Builds — pushes to `main` trigger deploys.
