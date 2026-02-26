@@ -1,0 +1,18 @@
+# local-ci configuration for stevedores-org/nix-cache
+# Mirrors .github/workflows/ci.yml
+# Run: local-ci typecheck test
+# Run all: local-ci lint format typecheck test
+
+[stages]
+
+[stages.typecheck]
+command = "bunx tsc --noEmit"
+
+[stages.lint]
+command = "bunx biome check src/"
+
+[stages.format]
+command = "bunx biome format --check src/"
+
+[stages.test]
+command = "bun test"
