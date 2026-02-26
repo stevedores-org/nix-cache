@@ -277,6 +277,92 @@ describe("nix-cache worker", () => {
     });
   });
 
+  describe("PUT overwrite", () => {
+    it("overwrites existing object with new content", async () => {
+      const auth = { Authorization: "Bearer test-secret-token" };
+
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/overwrite.narinfo", {
+          method: "PUT",
+          body: "version-1",
+          headers: auth,
+        }),
+        env,
+      );
+
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/overwrite.narinfo", {
+          method: "PUT",
+          body: "version-2",
+          headers: auth,
+        }),
+        env,
+      );
+
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/overwrite.narinfo"), env);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("version-2");
+    });
+  });
+
+  describe("response headers", () => {
+    it("includes etag on GET", async () => {
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/etag-test.narinfo", {
+          method: "PUT",
+          body: "etag-content",
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/etag-test.narinfo"), env);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("etag")).toBeTruthy();
+    });
+  });
+
+  describe("edge cases", () => {
+    it("rejects PATCH method", async () => {
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/test", { method: "PATCH" }), env);
+      expect(res.status).toBe(405);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toBe("Method not allowed");
+    });
+
+    it("rejects Bearer scheme with no token value", async () => {
+      const res = await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/test", {
+          method: "PUT",
+          body: "data",
+          headers: { Authorization: "Bearer " },
+        }),
+        env,
+      );
+      // "Bearer " splits to ["Bearer", ""] — empty token should be rejected
+      expect(res.status).toBe(401);
+    });
+
+    it("metrics auth failure increments counter", async () => {
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/metrics", {
+          headers: { Authorization: "Bearer wrong" },
+        }),
+        env,
+      );
+
+      // Check counter via authenticated metrics endpoint
+      const res = await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/metrics", {
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+      const json = (await res.json()) as Record<string, number>;
+      expect(json.auth_fail).toBe(1);
+    });
+  });
+
   describe("GET /metrics", () => {
     it("rejects unauthenticated requests", async () => {
       const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/metrics"), env);
