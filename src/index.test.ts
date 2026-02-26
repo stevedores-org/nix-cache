@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 
 // Minimal R2Object stub
 function makeR2Object(body: string, key: string) {
@@ -34,8 +34,12 @@ function makeKV() {
   const store = new Map<string, string>();
   return {
     store,
-    async get(key: string) { return store.get(key) || null; },
-    async put(key: string, value: string) { store.set(key, value); },
+    async get(key: string) {
+      return store.get(key) || null;
+    },
+    async put(key: string, value: string) {
+      store.set(key, value);
+    },
   };
 }
 
@@ -78,7 +82,7 @@ describe("nix-cache worker", () => {
     it("returns health JSON", async () => {
       const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/health"), env);
       expect(res.status).toBe(200);
-      const json = await res.json() as { status: string; cache: string };
+      const json = (await res.json()) as { status: string; cache: string };
       expect(json.status).toBe("ok");
       expect(json.cache).toBe("nix-cache");
     });
@@ -91,7 +95,7 @@ describe("nix-cache worker", () => {
         env,
       );
       expect(res.status).toBe(401);
-      const json = await res.json() as { error: string };
+      const json = (await res.json()) as { error: string };
       expect(json.error).toContain("Missing");
     });
 
@@ -131,10 +135,7 @@ describe("nix-cache worker", () => {
       expect(res.status).toBe(201);
 
       // Verify we can GET it back
-      const getRes = await worker.fetch(
-        new Request("https://nix-cache.stevedores.org/abc123.narinfo"),
-        env,
-      );
+      const getRes = await worker.fetch(new Request("https://nix-cache.stevedores.org/abc123.narinfo"), env);
       expect(getRes.status).toBe(200);
       expect(getRes.headers.get("Content-Type")).toBe("text/x-nix-narinfo");
       expect(await getRes.text()).toBe("StorePath: /nix/store/abc123-hello");
@@ -154,10 +155,7 @@ describe("nix-cache worker", () => {
       );
       expect(putRes.status).toBe(201);
 
-      const getRes = await worker.fetch(
-        new Request("https://nix-cache.stevedores.org/nar/abc123.nar"),
-        env,
-      );
+      const getRes = await worker.fetch(new Request("https://nix-cache.stevedores.org/nar/abc123.nar"), env);
       expect(getRes.status).toBe(200);
       expect(getRes.headers.get("Content-Type")).toBe("application/x-nix-archive");
       expect(await getRes.text()).toBe(narData);
@@ -166,20 +164,14 @@ describe("nix-cache worker", () => {
 
   describe("GET 404", () => {
     it("returns 404 for missing objects", async () => {
-      const res = await worker.fetch(
-        new Request("https://nix-cache.stevedores.org/nonexistent.narinfo"),
-        env,
-      );
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/nonexistent.narinfo"), env);
       expect(res.status).toBe(404);
     });
   });
 
   describe("method not allowed", () => {
     it("rejects DELETE", async () => {
-      const res = await worker.fetch(
-        new Request("https://nix-cache.stevedores.org/test", { method: "DELETE" }),
-        env,
-      );
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/test", { method: "DELETE" }), env);
       expect(res.status).toBe(405);
     });
   });
@@ -199,12 +191,95 @@ describe("nix-cache worker", () => {
     });
   });
 
-  describe("GET /metrics", () => {
-    it("rejects unauthenticated requests", async () => {
-      const res = await worker.fetch(
-        new Request("https://nix-cache.stevedores.org/metrics"),
+  // ── Issue #5: Namespace / protocol mismatch characterization ──
+  // The worker does flat R2 lookup. Attic-style namespaced paths like
+  // /stevedores/hash.narinfo are stored as "stevedores/hash.narinfo" in R2.
+  // These tests document the current behavior so regressions are caught
+  // if/when namespace routing is added.
+
+  describe("namespaced paths (issue #5)", () => {
+    it("stores and retrieves objects with namespace prefix", async () => {
+      const putRes = await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/stevedores/abc123.narinfo", {
+          method: "PUT",
+          body: "StorePath: /nix/store/abc123-namespaced",
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
         env,
       );
+      expect(putRes.status).toBe(201);
+
+      // R2 key is "stevedores/abc123.narinfo" (flat, with prefix)
+      const bucket = env.BUCKET as unknown as ReturnType<typeof makeBucket>;
+      expect(bucket.store.has("stevedores/abc123.narinfo")).toBe(true);
+
+      const getRes = await worker.fetch(new Request("https://nix-cache.stevedores.org/stevedores/abc123.narinfo"), env);
+      expect(getRes.status).toBe(200);
+      expect(await getRes.text()).toBe("StorePath: /nix/store/abc123-namespaced");
+    });
+
+    it("namespaced and root paths are isolated", async () => {
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/abc123.narinfo", {
+          method: "PUT",
+          body: "root-version",
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/lornu/abc123.narinfo", {
+          method: "PUT",
+          body: "lornu-version",
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+
+      const rootRes = await worker.fetch(new Request("https://nix-cache.stevedores.org/abc123.narinfo"), env);
+      expect(rootRes.status).toBe(200);
+      expect(await rootRes.text()).toBe("root-version");
+
+      const nsRes = await worker.fetch(new Request("https://nix-cache.stevedores.org/lornu/abc123.narinfo"), env);
+      expect(nsRes.status).toBe(200);
+      expect(await nsRes.text()).toBe("lornu-version");
+    });
+
+    it("sets correct content-type for namespaced .narinfo", async () => {
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/stevedores/xyz.narinfo", {
+          method: "PUT",
+          body: "StorePath: /nix/store/xyz-test",
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/stevedores/xyz.narinfo"), env);
+      expect(res.headers.get("Content-Type")).toBe("text/x-nix-narinfo");
+    });
+
+    it("sets correct content-type for namespaced .nar", async () => {
+      await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/stevedores/nar/xyz.nar", {
+          method: "PUT",
+          body: "nar-data",
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/stevedores/nar/xyz.nar"), env);
+      expect(res.headers.get("Content-Type")).toBe("application/x-nix-archive");
+    });
+
+    it("returns 404 for missing namespaced object", async () => {
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/oxidizedmlx/missing.narinfo"), env);
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("GET /metrics", () => {
+    it("rejects unauthenticated requests", async () => {
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/metrics"), env);
       expect(res.status).toBe(401);
     });
 
@@ -213,7 +288,8 @@ describe("nix-cache worker", () => {
       await worker.fetch(new Request("https://nix-cache.stevedores.org/miss.narinfo"), env);
       await worker.fetch(
         new Request("https://nix-cache.stevedores.org/obj", {
-          method: "PUT", body: "data",
+          method: "PUT",
+          body: "data",
           headers: { Authorization: "Bearer test-secret-token" },
         }),
         env,
@@ -221,7 +297,8 @@ describe("nix-cache worker", () => {
       await worker.fetch(new Request("https://nix-cache.stevedores.org/obj"), env);
       await worker.fetch(
         new Request("https://nix-cache.stevedores.org/obj", {
-          method: "PUT", body: "x",
+          method: "PUT",
+          body: "x",
           headers: { Authorization: "Bearer bad" },
         }),
         env,
@@ -234,7 +311,7 @@ describe("nix-cache worker", () => {
         env,
       );
       expect(res.status).toBe(200);
-      const json = await res.json() as Record<string, number>;
+      const json = (await res.json()) as Record<string, number>;
       expect(json.get_hit).toBe(1);
       expect(json.get_miss).toBe(1);
       expect(json.put_ok).toBe(1);

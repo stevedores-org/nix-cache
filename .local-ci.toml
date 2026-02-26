@@ -1,0 +1,18 @@
+# local-ci configuration for stevedores-org/nix-cache
+# Mirrors .github/workflows/ci.yml
+
+[dependencies]
+required = ["bun"]
+
+[stages.lint]
+command = ["bun", "run", "lint"]
+
+[stages.format]
+command = ["bun", "run", "format:check"]
+
+[stages.typecheck]
+command = ["bun", "run", "typecheck"]
+
+[stages.test]
+command = ["bun", "run", "test"]
+depends_on = ["lint", "typecheck"]

@@ -53,23 +53,23 @@ export default {
 
     // Nix cache info
     if (path === "/" || path === "/nix-cache-info") {
-      return new Response(
-        "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n",
-        {
-          headers: { "Content-Type": "text/x-nix-cache-info" },
-        }
-      );
+      return new Response("StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n", {
+        headers: { "Content-Type": "text/x-nix-cache-info" },
+      });
     }
 
     // Health check
     if (path === "/health") {
-      return new Response(JSON.stringify({
-        status: "ok",
-        cache: "nix-cache",
-        timestamp: new Date().toISOString()
-      }), {
-        headers: { "Content-Type": "application/json" }
-      });
+      return new Response(
+        JSON.stringify({
+          status: "ok",
+          cache: "nix-cache",
+          timestamp: new Date().toISOString(),
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        },
+      );
     }
 
     // Metrics endpoint (authenticated)
@@ -85,7 +85,7 @@ export default {
       for (const k of keys) {
         metrics[k] = parseInt((await env.METRICS?.get(k)) || "0", 10);
       }
-      metrics["get_total"] = metrics["get_hit"] + metrics["get_miss"];
+      metrics.get_total = metrics.get_hit + metrics.get_miss;
 
       return new Response(JSON.stringify(metrics, null, 2), {
         headers: { "Content-Type": "application/json" },
