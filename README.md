@@ -17,8 +17,10 @@ A Nix-compatible binary cache that serves pre-built Nix packages. Instead of bui
                     nix-cache.stevedores.org     nix-cache
 ```
 
-- **Worker**: Routes requests, sets correct MIME types
-- **R2**: Stores `.narinfo` (metadata) and `.nar` (archives) files
+- **Worker**: routing, edge cache, range requests, signature verification, constant-time auth
+- **R2**: stores `.narinfo` (metadata) and `.nar` (archives) files
+
+Hash-named paths only: `[0-9a-z]{32}\.narinfo` and `nar/[0-9a-z]{52}…\.nar(\.(xz|zst|bz2|br))?`. Anything else is rejected.
 
 ## Usage
 
@@ -34,7 +36,7 @@ A Nix-compatible binary cache that serves pre-built Nix packages. Instead of bui
     ];
     trusted-public-keys = [
       "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-      # Add your cache's public key here
+      "nix-cache.stevedores.org-1:Y2WLZtQTgxQ2QQzUnRDkDDKX08dL3NoNZ+Ohw3jv+7I="
     ];
   };
 }
@@ -45,7 +47,9 @@ A Nix-compatible binary cache that serves pre-built Nix packages. Instead of bui
 {
   nixConfig = {
     extra-substituters = [ "https://nix-cache.stevedores.org" ];
-    extra-trusted-public-keys = [ "your-key-here" ];
+    extra-trusted-public-keys = [
+      "nix-cache.stevedores.org-1:Y2WLZtQTgxQ2QQzUnRDkDDKX08dL3NoNZ+Ohw3jv+7I="
+    ];
   };
 }
 ```
@@ -55,78 +59,70 @@ A Nix-compatible binary cache that serves pre-built Nix packages. Instead of bui
 nix build --substituters "https://cache.nixos.org https://nix-cache.stevedores.org" .#package
 ```
 
-### For OCI/Container Builds
-
-When building container images with Nix:
-
-```bash
-# Build with custom cache
-nix build .#dockerImage \
-  --substituters "https://cache.nixos.org https://nix-cache.stevedores.org"
-
-# Load into Docker
-docker load < result
-```
-
-Or in a CI pipeline:
-```yaml
-- name: Build container
-  run: |
-    nix build .#dockerImage \
-      --substituters "https://cache.nixos.org https://nix-cache.stevedores.org" \
-      --trusted-public-keys "cache.nixos.org-1:... your-key:..."
-```
-
 ## Pushing to the Cache
 
-Upload pre-built packages after CI builds:
+Uploads require an `UPLOAD_TOKEN` (set as a Cloudflare secret). If `NIX_PUBLIC_KEY` is also set, the worker verifies every `.narinfo` against the configured Ed25519 public key and rejects unsigned or mismatched uploads.
+
+Two auth styles are accepted:
+
+**Basic (Nix-native, works with `nix copy --to`):**
 
 ```bash
-# Sign and upload a store path
 nix store sign --key-file /path/to/secret-key /nix/store/abc123-mypackage
-nix copy --to "https://nix-cache.stevedores.org" /nix/store/abc123-mypackage
+nix copy --to "https://uploader:$UPLOAD_TOKEN@nix-cache.stevedores.org" /nix/store/abc123-mypackage
 ```
 
-**Note:** PUT requests require `Authorization` header.
+The username is ignored; only the password (token) is checked.
+
+**Bearer (for `curl` or generic HTTP clients):**
+
+```bash
+curl -X PUT -H "Authorization: Bearer $UPLOAD_TOKEN" \
+  --data-binary @abc123.narinfo \
+  https://nix-cache.stevedores.org/abc123.narinfo
+```
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Cache info |
-| `/nix-cache-info` | GET | Cache info |
-| `/health` | GET | Health check (JSON) |
-| `/<hash>.narinfo` | GET | Package metadata |
-| `/nar/<hash>.nar` | GET | Package archive |
-| `/*` | PUT | Upload (requires auth) |
+| Endpoint              | Method     | Description                                |
+|-----------------------|------------|--------------------------------------------|
+| `/nix-cache-info`     | GET        | Cache info (cached 1h)                     |
+| `/health`             | GET        | Health check (JSON)                        |
+| `/<hash>.narinfo`     | GET / HEAD | Package metadata (immutable, range-able)   |
+| `/nar/<hash>.nar`     | GET / HEAD | Package archive (immutable, range-able)    |
+| `/<hash>.narinfo`     | PUT        | Upload narinfo (auth + signature required) |
+| `/nar/<hash>.nar(.*)` | PUT        | Upload NAR archive (auth required)         |
+
+GET responses are tagged `Cache-Control: public, max-age=31536000, immutable` and replicated to Cloudflare's edge cache on first hit. `Range` requests get `206 Partial Content`; `If-None-Match` works through edge cache revalidation.
 
 ## Development
 
 ```bash
-# Install deps
 bun install
-
-# Run locally
-bunx wrangler dev
-
-# Deploy
-bunx wrangler deploy
+bunx wrangler dev      # local dev
+bun run typecheck      # tsc --noEmit
+bunx wrangler deploy   # ship to Cloudflare
 ```
 
 ## Cloudflare Setup
 
-1. Create R2 bucket named `nix-cache`
-2. Add custom domain `nix-cache.stevedores.org`
-3. Deploy worker with `wrangler deploy`
+1. Create R2 bucket named `nix-cache`.
+2. Add custom domain `nix-cache.stevedores.org`.
+3. Set secrets:
+   ```bash
+   wrangler secret put UPLOAD_TOKEN      # required for PUTs to work
+   wrangler secret put NIX_PUBLIC_KEY    # optional, enforces signed narinfo
+   ```
+4. `wrangler deploy`.
+
+Without `UPLOAD_TOKEN`, PUT returns `503 Uploads disabled` — the cache is read-only.
 
 ## Generating Cache Keys
 
 ```bash
-# Generate signing key pair
 nix-store --generate-binary-cache-key nix-cache.stevedores.org-1 secret-key public-key
-
-# secret-key: Keep safe, use for signing
-# public-key: Distribute to clients
+# secret-key: keep safe, used for signing
+# public-key: set as NIX_PUBLIC_KEY secret, distribute to clients in trusted-public-keys
 ```
 
 ## License

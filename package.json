@@ -1,15 +1,16 @@
 {
     "name": "nix-cache",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "main": "src/index.ts",
     "scripts": {
         "build": "bun x wrangler deploy --dry-run",
         "deploy": "bun x wrangler deploy",
-        "dev": "bun x wrangler dev"
+        "dev": "bun x wrangler dev",
+        "typecheck": "bun x tsc --noEmit"
     },
     "devDependencies": {
-        "@cloudflare/workers-types": "^4.20240320.1",
-        "typescript": "^5.4.3",
-        "wrangler": "^3.35.0"
+        "@cloudflare/workers-types": "^4.20250101.0",
+        "typescript": "^5.6.0",
+        "wrangler": "^4.0.0"
     }
 }
