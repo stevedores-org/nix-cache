@@ -1,6 +1,7 @@
 name = "nix-cache"
 main = "src/index.ts"
 compatibility_date = "2026-01-15"
+account_id = "f1be33af27cf878e2e81cb29a0d886f7"
 
 [[routes]]
 pattern = "nix-cache.stevedores.org/*"
