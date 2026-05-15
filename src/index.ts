@@ -21,6 +21,8 @@ const NAR_RE = /^nar\/[0-9a-z]{52}(-[0-9a-z+._-]+)?\.nar(\.(xz|zst|bz2|br))?$/;
 
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 
+// Per-isolate cache of the imported Ed25519 key. Cloudflare reloads the isolate
+// on secret updates and deploys, so invalidation is implicit.
 let publicKeyCache: { keyName: string; key: CryptoKey } | null = null;
 
 export default {
@@ -68,13 +70,7 @@ async function handleRead(
     return new Response("Not found", { status: 404 });
   }
 
-  // Edge cache check — hash-named, immutable content is the perfect candidate.
-  const cache = caches.default;
-  const cacheKey = new Request(url.toString(), { method: "GET" });
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached;
-
-  // HEAD: avoid streaming the body.
+  // HEAD: use R2.head() — never goes through the body cache.
   if (request.method === "HEAD") {
     const head = await env.BUCKET.head(objectName);
     if (!head) return new Response(null, { status: 404 });
@@ -88,11 +84,12 @@ async function handleRead(
     return new Response(null, { status: 200, headers });
   }
 
-  // Range support.
+  // Parse Range header before consulting the cache — cache stores full 200s
+  // only, so any Range request must bypass it and go straight to R2 for a 206.
   const rangeHeader = request.headers.get("range");
-  const r2Opts: R2GetOptions = {};
   let requestedOffset: number | undefined;
   let requestedLength: number | undefined;
+  const r2Opts: R2GetOptions = {};
   if (rangeHeader) {
     const m = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader);
     if (m) {
@@ -104,6 +101,14 @@ async function handleRead(
           ? { offset: requestedOffset, length: requestedLength }
           : { offset: requestedOffset };
     }
+  }
+
+  // Edge cache: hash-named, immutable full-object GETs only.
+  const cache = caches.default;
+  const cacheKey = new Request(url.toString(), { method: "GET" });
+  if (requestedOffset === undefined) {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
   }
 
   const object = await env.BUCKET.get(objectName, r2Opts);
