@@ -36,7 +36,7 @@ Hash-named paths only: `[0-9a-z]{32}\.narinfo` and `nar/[0-9a-z]{52}…\.nar(\.(
     ];
     trusted-public-keys = [
       "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-      # Add your cache's public key here
+      "nix-cache.stevedores.org-1:Y2WLZtQTgxQ2QQzUnRDkDDKX08dL3NoNZ+Ohw3jv+7I="
     ];
   };
 }
@@ -47,7 +47,9 @@ Hash-named paths only: `[0-9a-z]{32}\.narinfo` and `nar/[0-9a-z]{52}…\.nar(\.(
 {
   nixConfig = {
     extra-substituters = [ "https://nix-cache.stevedores.org" ];
-    extra-trusted-public-keys = [ "your-key-here" ];
+    extra-trusted-public-keys = [
+      "nix-cache.stevedores.org-1:Y2WLZtQTgxQ2QQzUnRDkDDKX08dL3NoNZ+Ohw3jv+7I="
+    ];
   };
 }
 ```
