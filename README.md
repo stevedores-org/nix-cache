@@ -119,14 +119,16 @@ Without `UPLOAD_TOKEN`, PUT returns `503 Uploads disabled` — the cache is read
 
 ## Operations
 
-Tail logs (including `cache.put` failures — large bodies, transient backpressure, etc.):
+Tail logs cover both `cache.put` failure modes:
 
 ```bash
 bunx wrangler tail
 ```
 
-A silent `cache.put` failure on a hot object turns every request into a cold R2 read forever, so log entries of the form
-`cache.put failed for <name> (size=<bytes>): <error>` are an early signal worth watching.
+- `cache.put skipped for <name> (size=<bytes> >= limit=<limit>)` — body above `CACHE_PUT_BYTE_LIMIT` (50 MB; see `src/index.ts`). Skipped pre-flight to avoid the wasted body clone + silent reject.
+- `cache.put failed for <name> (size=<bytes>): <error>` — body under the limit, but the put rejected (transient backpressure, network blip). Either failure mode turns every subsequent request into a cold R2 read, so log entries here are an early signal worth watching.
+
+NARs above the 50 MB limit therefore read from R2 cold on every request. This is acceptable for low traffic but degrades steady-state latency at scale. The longer-term path is **Path A**: serve `/nar/*` via an R2 Custom Domain so Cloudflare's CDN caches large objects directly, taking the worker out of the egress path entirely. See [issue #24](https://github.com/stevedores-org/nix-cache/issues/24).
 
 ## Generating Cache Keys
 
