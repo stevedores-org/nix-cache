@@ -103,16 +103,51 @@ async function handleRead(
     }
   }
 
-  // Edge cache: hash-named, immutable full-object GETs only.
+  // Forward If-None-Match to R2 on full (non-range) GETs. Lets R2 short-
+  // circuit the response body when the client's etag is current, which is
+  // the cold-revalidation path that the edge cache no longer covers
+  // (cache.match() below already short-circuits the warm path).
+  // Skip when Range is set — combining range + conditional has interaction
+  // edge cases per RFC 9110 §13.1 that aren't worth modeling.
+  const ifNoneMatch = request.headers.get("if-none-match");
+  const conditionalEtag =
+    requestedOffset === undefined && ifNoneMatch
+      ? normalizeEtag(ifNoneMatch)
+      : undefined;
+  if (conditionalEtag) {
+    r2Opts.onlyIf = { etagDoesNotMatch: conditionalEtag };
+  }
+
+  // Edge cache: hash-named, immutable full-object GETs only. Skip when the
+  // client is revalidating with If-None-Match — the cache may hold a body
+  // whose etag the client already has, in which case we want the conditional
+  // path to surface a 304 instead.
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), { method: "GET" });
-  if (requestedOffset === undefined) {
+  if (requestedOffset === undefined && !conditionalEtag) {
     const cached = await cache.match(cacheKey);
     if (cached) return cached;
   }
 
   const object = await env.BUCKET.get(objectName, r2Opts);
-  if (!object) return new Response("Not found", { status: 404 });
+  if (!object) {
+    // Distinguish "precondition failed" (→ 304) from "not found" (→ 404).
+    // R2 returns null for both when onlyIf is set; a HEAD probe tells us
+    // which. Only fires on the cold-revalidation hit path.
+    if (conditionalEtag) {
+      const head = await env.BUCKET.head(objectName);
+      if (head) {
+        return new Response(null, {
+          status: 304,
+          headers: {
+            etag: head.httpEtag,
+            "Cache-Control": IMMUTABLE_CACHE,
+          },
+        });
+      }
+    }
+    return new Response("Not found", { status: 404 });
+  }
 
   const headers = new Headers();
   object.writeHttpMetadata(headers);
@@ -199,6 +234,22 @@ function extractAuthToken(authHeader: string | null): string {
 
 function isValidPath(p: string): boolean {
   return NARINFO_RE.test(p) || NAR_RE.test(p);
+}
+
+/**
+ * Strip optional `W/` weak-validator prefix and surrounding quotes from an
+ * `If-None-Match` value. R2's stored etag is the unquoted form, so we
+ * normalize before the comparison.
+ *
+ * Returns the original string if it doesn't fit the standard etag shape —
+ * lets the caller decide whether to treat it as a literal etag or skip the
+ * conditional. We follow the standard shape (`"abc"` or `W/"abc"`) and fall
+ * back to passing through for client-supplied etags that arrive bare.
+ */
+function normalizeEtag(value: string): string {
+  const stripped = value.replace(/^W\//, "");
+  const m = /^"(.*)"$/.exec(stripped);
+  return m ? m[1] : stripped;
 }
 
 function setContentType(headers: Headers, path: string): void {
