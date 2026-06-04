@@ -172,4 +172,22 @@ describe("resolveRange", () => {
       kind: "unsatisfiable",
     });
   });
+
+  // arithmetic-boundary cases that catch off-by-one regressions in the
+  // resolveRange math:
+  test("prefix offset == size - 1, no length → last byte (1 byte)", () => {
+    expect(resolveRange({ kind: "prefix", offset: SIZE - 1 }, SIZE)).toEqual({
+      kind: "satisfied",
+      start: SIZE - 1,
+      length: 1,
+    });
+  });
+
+  test("prefix offset == 0, length == size → exact full body via range", () => {
+    expect(resolveRange({ kind: "prefix", offset: 0, length: SIZE }, SIZE)).toEqual({
+      kind: "satisfied",
+      start: 0,
+      length: SIZE,
+    });
+  });
 });

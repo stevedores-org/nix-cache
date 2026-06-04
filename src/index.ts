@@ -105,10 +105,8 @@ async function handleRead(
   // accept the suffix form `bytes=-N`.
   const parsedRange = parseRangeHeader(request.headers.get("range"));
   if (parsedRange?.kind === "invalid") {
-    return new Response("Range Not Satisfiable", {
-      status: 416,
-      headers: { "Accept-Ranges": "bytes" },
-    });
+    // Pre-R2: object size unknown, so the `Content-Range` header is omitted.
+    return rangeNotSatisfiable();
   }
 
   const r2Opts: R2GetOptions = {};
@@ -159,13 +157,7 @@ async function handleRead(
       }
       // Path 2: Range request was out of bounds (416).
       if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
-        return new Response("Range Not Satisfiable", {
-          status: 416,
-          headers: {
-            "Content-Range": `bytes */${head.size}`,
-            "Accept-Ranges": "bytes",
-          },
-        });
+        return rangeNotSatisfiable(head.size);
       }
     }
     return new Response("Not found", { status: 404 });
@@ -182,13 +174,7 @@ async function handleRead(
   if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
     const outcome = resolveRange(parsedRange, object.size);
     if (outcome.kind === "unsatisfiable") {
-      return new Response("Range Not Satisfiable", {
-        status: 416,
-        headers: {
-          "Content-Range": `bytes */${object.size}`,
-          "Accept-Ranges": "bytes",
-        },
-      });
+      return rangeNotSatisfiable(object.size);
     }
     headers.set(
       "Content-Range",
@@ -286,6 +272,28 @@ function extractAuthToken(authHeader: string | null): string {
 
 function isValidPath(p: string): boolean {
   return NARINFO_RE.test(p) || NAR_RE.test(p);
+}
+
+/**
+ * Build a 416 Range Not Satisfiable response.
+ *
+ * When `objectSize` is known, includes `Content-Range: bytes * /<size>` per
+ * RFC 9110 §15.5.17. The pre-R2 invalid-syntax path (multi-range, inverted,
+ * zero-suffix) doesn't know the size and omits the header.
+ *
+ * The 416 is response-cacheable for hash-named immutable content: given
+ * (hash, range), the 416 is itself stable. Same `Cache-Control` as the
+ * 206/200 paths so the edge cache treats all responses for a hash uniformly.
+ */
+function rangeNotSatisfiable(objectSize?: number): Response {
+  const headers: Record<string, string> = {
+    "Accept-Ranges": "bytes",
+    "Cache-Control": IMMUTABLE_CACHE,
+  };
+  if (objectSize !== undefined) {
+    headers["Content-Range"] = `bytes */${objectSize}`;
+  }
+  return new Response("Range Not Satisfiable", { status: 416, headers });
 }
 
 /**
