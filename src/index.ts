@@ -103,10 +103,9 @@ async function handleRead(
     }
   }
 
-  // Forward If-None-Match to R2 on full (non-range) GETs. Lets R2 short-
-  // circuit the response body when the client's etag is current, which is
-  // the cold-revalidation path that the edge cache no longer covers
-  // (cache.match() below already short-circuits the warm path).
+  // Forward If-None-Match to R2 on full (non-range) GETs only after an edge
+  // cache miss. Warm cache hits stay on the edge path; the conditional
+  // comparison is handled from the cached response headers.
   // Skip when Range is set — combining range + conditional has interaction
   // edge cases per RFC 9110 §13.1 that aren't worth modeling.
   const ifNoneMatch = request.headers.get("if-none-match");
@@ -119,14 +118,15 @@ async function handleRead(
   }
 
   // Edge cache: hash-named, immutable full-object GETs only. Skip when the
-  // client is revalidating with If-None-Match — the cache may hold a body
-  // whose etag the client already has, in which case we want the conditional
-  // path to surface a 304 instead.
+  // client is revalidating with If-None-Match, but decide the response from
+  // the cached headers so warm revalidation stays edge-only.
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), { method: "GET" });
-  if (requestedOffset === undefined && !conditionalEtag) {
+  if (requestedOffset === undefined) {
     const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return respondFromCache(cached, conditionalEtag);
+    }
   }
 
   const object = await env.BUCKET.get(objectName, r2Opts);
@@ -246,7 +246,24 @@ function isValidPath(p: string): boolean {
  * conditional. We follow the standard shape (`"abc"` or `W/"abc"`) and fall
  * back to passing through for client-supplied etags that arrive bare.
  */
-function normalizeEtag(value: string): string {
+export function respondFromCache(cached: Response, conditionalEtag?: string): Response {
+  if (conditionalEtag) {
+    const cachedEtag = normalizeEtag(cached.headers.get("etag") ?? "");
+    if (cachedEtag === conditionalEtag) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          etag: cached.headers.get("etag") ?? conditionalEtag,
+          "Cache-Control": IMMUTABLE_CACHE,
+        },
+      });
+    }
+  }
+
+  return cached;
+}
+
+export function normalizeEtag(value: string): string {
   const stripped = value.replace(/^W\//, "");
   const m = /^"(.*)"$/.exec(stripped);
   return m ? m[1] : stripped;
