@@ -21,6 +21,14 @@ const NAR_RE = /^nar\/[0-9a-z]{52}(-[0-9a-z+._-]+)?\.nar(\.(xz|zst|bz2|br))?$/;
 
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 
+// Objects this large or larger won't fit in the Cache API's per-entry body
+// limit. Putting them anyway silently fails — the put rejects after the
+// body is uploaded — and every subsequent request reads from R2 cold.
+// Skipping the put outright + logging is the smallest fix; the longer-term
+// path is to serve /nar/* via an R2 Custom Domain so the worker is out of
+// the egress path for large objects entirely (#24).
+const CACHE_PUT_BYTE_LIMIT = 50 * 1024 * 1024; // 50 MB; conservative
+
 // Per-isolate cache of the imported Ed25519 key. Cloudflare reloads the isolate
 // on secret updates and deploys, so invalidation is implicit.
 let publicKeyCache: { keyName: string; key: CryptoKey } | null = null;
@@ -145,19 +153,29 @@ async function handleRead(
   const response = new Response(object.body, { status, headers });
 
   // Only cache full 200 responses — partials would pollute the edge cache.
-  // Failures (body too large for cache.put, transient backpressure, …) are
-  // logged via console.error so they show up in `wrangler tail`. Without
-  // this, a put that silently fails turns every request into a cold R2 read
-  // forever with no warning.
+  // Two failure modes, two defences:
+  //   1. Body above the Cache API per-entry limit → skip the put outright
+  //      (the request would otherwise pay for the body clone + a wasted
+  //      background upload that silently rejects).
+  //   2. Anything below the limit that still rejects (transient backpressure,
+  //      network blips) → log via console.error so it shows up in
+  //      `wrangler tail` instead of vanishing.
+  // Path A (R2 Custom Domain for /nar/*) is the longer-term fix for (1).
   if (status === 200) {
-    ctx.waitUntil(
-      cache.put(cacheKey, response.clone()).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          `cache.put failed for ${objectName} (size=${object.size}): ${message}`,
-        );
-      }),
-    );
+    if (object.size >= CACHE_PUT_BYTE_LIMIT) {
+      console.log(
+        `cache.put skipped for ${objectName} (size=${object.size} >= limit=${CACHE_PUT_BYTE_LIMIT})`,
+      );
+    } else {
+      ctx.waitUntil(
+        cache.put(cacheKey, response.clone()).catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(
+            `cache.put failed for ${objectName} (size=${object.size}): ${message}`,
+          );
+        }),
+      );
+    }
   }
 
   return response;
