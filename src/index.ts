@@ -100,35 +100,76 @@ async function handleRead(
     return new Response(null, { status: 200, headers });
   }
 
-  // Parse Range header before consulting the cache — cache stores full 200s
-  // only, so any Range request must bypass it and go straight to R2 for a 206.
-  const rangeHeader = request.headers.get("range");
-  let requestedOffset: number | undefined;
-  let requestedLength: number | undefined;
+  // Parse Range header. Cache stores full 200s only, so any range form
+  // bypasses it and goes to R2 for a 206. Reject multi-range with 416;
+  // accept the suffix form `bytes=-N`.
+  const parsedRange = parseRangeHeader(request.headers.get("range"));
+  if (parsedRange?.kind === "invalid") {
+    return new Response("Range Not Satisfiable", {
+      status: 416,
+      headers: { "Accept-Ranges": "bytes" },
+    });
+  }
+
   const r2Opts: R2GetOptions = {};
-  if (rangeHeader) {
-    const m = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader);
-    if (m) {
-      requestedOffset = parseInt(m[1], 10);
-      const end = m[2] ? parseInt(m[2], 10) : undefined;
-      if (end !== undefined) requestedLength = end - requestedOffset + 1;
-      r2Opts.range =
-        requestedLength !== undefined
-          ? { offset: requestedOffset, length: requestedLength }
-          : { offset: requestedOffset };
-    }
+  if (parsedRange?.kind === "prefix") {
+    r2Opts.range =
+      parsedRange.length !== undefined
+        ? { offset: parsedRange.offset, length: parsedRange.length }
+        : { offset: parsedRange.offset };
+  } else if (parsedRange?.kind === "suffix") {
+    r2Opts.range = { suffix: parsedRange.length };
+  }
+
+  // Forward If-None-Match to R2 on full (non-range) GETs only after an edge
+  // cache miss. Warm cache hits stay on the edge path; the conditional
+  // comparison is handled from the cached response headers.
+  const ifNoneMatch = request.headers.get("if-none-match");
+  const conditionalEtag =
+    parsedRange === null && ifNoneMatch ? normalizeEtag(ifNoneMatch) : undefined;
+  if (conditionalEtag) {
+    r2Opts.onlyIf = { etagDoesNotMatch: conditionalEtag };
   }
 
   // Edge cache: hash-named, immutable full-object GETs only.
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), { method: "GET" });
-  if (requestedOffset === undefined) {
+  if (parsedRange === null) {
     const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return respondFromCache(cached, conditionalEtag);
+    }
   }
 
   const object = await env.BUCKET.get(objectName, r2Opts);
-  if (!object) return new Response("Not found", { status: 404 });
+  if (!object) {
+    // R2 returns null for missing keys OR ranges past the end of an object
+    // OR if the onlyIf condition failed. Disambiguate via HEAD.
+    const head = await env.BUCKET.head(objectName);
+    if (head) {
+      // Path 1: Conditional GET matched (304).
+      if (conditionalEtag && head.httpEtag === conditionalEtag) {
+        return new Response(null, {
+          status: 304,
+          headers: {
+            etag: head.httpEtag,
+            "Cache-Control": IMMUTABLE_CACHE,
+          },
+        });
+      }
+      // Path 2: Range request was out of bounds (416).
+      if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
+        return new Response("Range Not Satisfiable", {
+          status: 416,
+          headers: {
+            "Content-Range": `bytes */${head.size}`,
+            "Accept-Ranges": "bytes",
+          },
+        });
+      }
+    }
+    return new Response("Not found", { status: 404 });
+  }
 
   const headers = new Headers();
   object.writeHttpMetadata(headers);
@@ -138,13 +179,22 @@ async function handleRead(
   headers.set("Accept-Ranges", "bytes");
 
   let status = 200;
-  if (requestedOffset !== undefined) {
-    const length = requestedLength ?? object.size - requestedOffset;
+  if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
+    const outcome = resolveRange(parsedRange, object.size);
+    if (outcome.kind === "unsatisfiable") {
+      return new Response("Range Not Satisfiable", {
+        status: 416,
+        headers: {
+          "Content-Range": `bytes */${object.size}`,
+          "Accept-Ranges": "bytes",
+        },
+      });
+    }
     headers.set(
       "Content-Range",
-      `bytes ${requestedOffset}-${requestedOffset + length - 1}/${object.size}`,
+      `bytes ${outcome.start}-${outcome.start + outcome.length - 1}/${object.size}`,
     );
-    headers.set("Content-Length", String(length));
+    headers.set("Content-Length", String(outcome.length));
     status = 206;
   } else {
     headers.set("Content-Length", String(object.size));
@@ -236,6 +286,123 @@ function extractAuthToken(authHeader: string | null): string {
 
 function isValidPath(p: string): boolean {
   return NARINFO_RE.test(p) || NAR_RE.test(p);
+}
+
+/**
+ * Parsed shape of an HTTP Range header for a single-range read.
+ *
+ * - `prefix`     — `bytes=N-` or `bytes=N-M`. `length` undefined means "to end".
+ * - `suffix`     — `bytes=-N`. Last N bytes of the object.
+ * - `invalid`    — multi-range, inverted range, or zero-length suffix.
+ *                  Callers MUST respond with 416 Range Not Satisfiable.
+ *
+ * Returns `null` for `null` header or unrecognised malformed syntax,
+ * in which case the caller treats it as no Range header (RFC 9110 §14.2).
+ */
+export type ParsedRange =
+  | { kind: "prefix"; offset: number; length?: number }
+  | { kind: "suffix"; length: number }
+  | { kind: "invalid" };
+
+export function parseRangeHeader(header: string | null): ParsedRange | null {
+  if (!header) return null;
+
+  // Multi-range: a comma anywhere in the byte ranges. We don't support it —
+  // R2 single-range is enough for narinfo/NAR access patterns.
+  if (header.includes(",")) {
+    return { kind: "invalid" };
+  }
+
+  const suffix = /^bytes=-(\d+)$/.exec(header);
+  if (suffix) {
+    const length = parseInt(suffix[1], 10);
+    return length > 0 ? { kind: "suffix", length } : { kind: "invalid" };
+  }
+
+  const single = /^bytes=(\d+)-(\d*)$/.exec(header);
+  if (single) {
+    const offset = parseInt(single[1], 10);
+    if (!single[2]) return { kind: "prefix", offset };
+    const end = parseInt(single[2], 10);
+    if (end < offset) return { kind: "invalid" };
+    return { kind: "prefix", offset, length: end - offset + 1 };
+  }
+
+  return null; // unrecognised — caller treats as no Range
+}
+
+/**
+ * The two `ParsedRange` shapes that can be sent to R2 (i.e. not `invalid`).
+ * `resolveRange` accepts this narrowed type so the unsatisfiable detection
+ * is purely about size, not syntax.
+ */
+export type RangeRequest =
+  | { kind: "prefix"; offset: number; length?: number }
+  | { kind: "suffix"; length: number };
+
+/**
+ * Result of intersecting a parsed range with the object's actual size.
+ *
+ * - `satisfied`     — `start` (inclusive) + `length` resolve to bytes that
+ *                     exist in the object. The caller uses these to build
+ *                     `Content-Range` and `Content-Length`.
+ * - `unsatisfiable` — the range references bytes the object doesn't have
+ *                     (offset >= size, or zero-suffix). Caller MUST respond
+ *                     with 416 + `Content-Range: bytes * /<size>`.
+ *
+ * The end of the served byte run is `start + length - 1`. For prefix ranges
+ * whose explicit end exceeds the object, the end is clamped to `size - 1`
+ * per RFC 9110 §14.1.2. For suffix ranges where N >= size, the whole object
+ * is served.
+ */
+export type RangeOutcome =
+  | { kind: "satisfied"; start: number; length: number }
+  | { kind: "unsatisfiable" };
+
+export function resolveRange(req: RangeRequest, objectSize: number): RangeOutcome {
+  // RFC 9110 §14.1.2: a byte-range-set is satisfiable iff at least one spec
+  // identifies bytes that exist. An empty object has none.
+  if (objectSize === 0) return { kind: "unsatisfiable" };
+
+  if (req.kind === "prefix") {
+    if (req.offset >= objectSize) return { kind: "unsatisfiable" };
+    const end =
+      req.length !== undefined
+        ? Math.min(req.offset + req.length - 1, objectSize - 1)
+        : objectSize - 1;
+    return { kind: "satisfied", start: req.offset, length: end - req.offset + 1 };
+  }
+  // suffix
+  if (req.length === 0) return { kind: "unsatisfiable" };
+  const length = Math.min(req.length, objectSize);
+  return { kind: "satisfied", start: objectSize - length, length };
+}
+
+/**
+ * Decide whether to serve a 304 or return the cached response based on the
+ * client's conditional etag.
+ */
+export function respondFromCache(cached: Response, conditionalEtag?: string): Response {
+  if (conditionalEtag) {
+    const cachedEtag = normalizeEtag(cached.headers.get("etag") ?? "");
+    if (cachedEtag === conditionalEtag) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          etag: cached.headers.get("etag") ?? conditionalEtag,
+          "Cache-Control": IMMUTABLE_CACHE,
+        },
+      });
+    }
+  }
+
+  return cached;
+}
+
+export function normalizeEtag(value: string): string {
+  const stripped = value.replace(/^W\//, "");
+  const m = /^"(.*)"$/.exec(stripped);
+  return m ? m[1] : stripped;
 }
 
 function setContentType(headers: Headers, path: string): void {
