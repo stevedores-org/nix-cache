@@ -70,8 +70,18 @@ async function handleRead(
     return new Response("Not found", { status: 404 });
   }
 
-  // HEAD: use R2.head() — never goes through the body cache.
+  // HEAD: prefer the cached GET response, then fall back to R2.head() on miss.
   if (request.method === "HEAD") {
+    const cache = caches.default;
+    const cacheKey = new Request(url.toString(), { method: "GET" });
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      return new Response(null, {
+        status: 200,
+        headers: new Headers(cached.headers),
+      });
+    }
+
     const head = await env.BUCKET.head(objectName);
     if (!head) return new Response(null, { status: 404 });
     const headers = new Headers();

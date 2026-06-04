@@ -95,6 +95,8 @@ curl -X PUT -H "Authorization: Bearer $UPLOAD_TOKEN" \
 
 GET responses are tagged `Cache-Control: public, max-age=31536000, immutable` and replicated to Cloudflare's edge cache on first hit. `Range` requests get `206 Partial Content`; `If-None-Match` works through edge cache revalidation.
 
+`HEAD` requests now try the cached `GET` response first and only fall back to R2 metadata on a cold miss.
+
 ## Development
 
 ```bash
