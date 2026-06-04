@@ -123,7 +123,25 @@ async function handleRead(
   }
 
   const object = await env.BUCKET.get(objectName, r2Opts);
-  if (!object) return new Response("Not found", { status: 404 });
+  if (!object) {
+    // For range requests, R2 returns null both for missing keys AND for
+    // ranges past the end of an existing object. Disambiguate via HEAD so
+    // we can return 416 with a real `Content-Range: bytes */<size>` for
+    // the latter, matching RFC 9110 §15.5.17.
+    if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
+      const head = await env.BUCKET.head(objectName);
+      if (head) {
+        return new Response("Range Not Satisfiable", {
+          status: 416,
+          headers: {
+            "Content-Range": `bytes */${head.size}`,
+            "Accept-Ranges": "bytes",
+          },
+        });
+      }
+    }
+    return new Response("Not found", { status: 404 });
+  }
 
   const headers = new Headers();
   object.writeHttpMetadata(headers);
@@ -133,22 +151,27 @@ async function handleRead(
   headers.set("Accept-Ranges", "bytes");
 
   let status = 200;
-  if (parsedRange !== null) {
-    let start: number;
-    let length: number;
-    if (parsedRange.kind === "prefix") {
-      start = parsedRange.offset;
-      length = parsedRange.length ?? object.size - start;
-    } else {
-      // suffix: clamp to size when N >= size (RFC 9110 §14.1.2)
-      length = Math.min(parsedRange.length, object.size);
-      start = object.size - length;
+  if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
+    const outcome = resolveRange(parsedRange, object.size);
+    if (outcome.kind === "unsatisfiable") {
+      // The range parsed cleanly but the object's actual size makes it
+      // unsatisfiable (e.g. `bytes=N-` with N >= size). Return 416 with
+      // `Content-Range: bytes */<size>` per RFC 9110 §15.5.17. The R2 GET
+      // we just made was the cheapest path to learning object.size (a
+      // separate HEAD would cost the same Class B op).
+      return new Response("Range Not Satisfiable", {
+        status: 416,
+        headers: {
+          "Content-Range": `bytes */${object.size}`,
+          "Accept-Ranges": "bytes",
+        },
+      });
     }
     headers.set(
       "Content-Range",
-      `bytes ${start}-${start + length - 1}/${object.size}`,
+      `bytes ${outcome.start}-${outcome.start + outcome.length - 1}/${object.size}`,
     );
-    headers.set("Content-Length", String(length));
+    headers.set("Content-Length", String(outcome.length));
     status = 206;
   } else {
     headers.set("Content-Length", String(object.size));
@@ -273,6 +296,53 @@ export function parseRangeHeader(header: string | null): ParsedRange | null {
   }
 
   return null; // unrecognised — caller treats as no Range
+}
+
+/**
+ * The two `ParsedRange` shapes that can be sent to R2 (i.e. not `invalid`).
+ * `resolveRange` accepts this narrowed type so the unsatisfiable detection
+ * is purely about size, not syntax.
+ */
+export type RangeRequest =
+  | { kind: "prefix"; offset: number; length?: number }
+  | { kind: "suffix"; length: number };
+
+/**
+ * Result of intersecting a parsed range with the object's actual size.
+ *
+ * - `satisfied`     — `start` (inclusive) + `length` resolve to bytes that
+ *                     exist in the object. The caller uses these to build
+ *                     `Content-Range` and `Content-Length`.
+ * - `unsatisfiable` — the range references bytes the object doesn't have
+ *                     (offset >= size, or zero-suffix). Caller MUST respond
+ *                     with 416 + `Content-Range: bytes * /<size>`.
+ *
+ * The end of the served byte run is `start + length - 1`. For prefix ranges
+ * whose explicit end exceeds the object, the end is clamped to `size - 1`
+ * per RFC 9110 §14.1.2. For suffix ranges where N >= size, the whole object
+ * is served.
+ */
+export type RangeOutcome =
+  | { kind: "satisfied"; start: number; length: number }
+  | { kind: "unsatisfiable" };
+
+export function resolveRange(req: RangeRequest, objectSize: number): RangeOutcome {
+  // RFC 9110 §14.1.2: a byte-range-set is satisfiable iff at least one spec
+  // identifies bytes that exist. An empty object has none.
+  if (objectSize === 0) return { kind: "unsatisfiable" };
+
+  if (req.kind === "prefix") {
+    if (req.offset >= objectSize) return { kind: "unsatisfiable" };
+    const end =
+      req.length !== undefined
+        ? Math.min(req.offset + req.length - 1, objectSize - 1)
+        : objectSize - 1;
+    return { kind: "satisfied", start: req.offset, length: end - req.offset + 1 };
+  }
+  // suffix
+  if (req.length === 0) return { kind: "unsatisfiable" };
+  const length = Math.min(req.length, objectSize);
+  return { kind: "satisfied", start: objectSize - length, length };
 }
 
 function setContentType(headers: Headers, path: string): void {
