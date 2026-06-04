@@ -70,8 +70,24 @@ async function handleRead(
     return new Response("Not found", { status: 404 });
   }
 
-  // HEAD: use R2.head() — never goes through the body cache.
+  // HEAD: try the GET-shaped edge cache entry first. Hash-named content is
+  // immutable, so any GET that previously hit this URL stored a 200 with
+  // the headers a HEAD wants. Returning those headers without a body costs
+  // one cache lookup (~1ms at-edge) instead of an R2.head() round-trip
+  // (~20-50ms + Class B op).
+  //
+  // Nix substituter clients fan out many parallel HEAD probes during
+  // dependency resolution; this turns the steady-state into edge-only.
   if (request.method === "HEAD") {
+    const cacheKey = new Request(request.url, { method: "GET" });
+    const cached = await caches.default.match(cacheKey);
+    if (cached) {
+      // Headers are already complete (etag, Content-Length, Content-Type,
+      // Cache-Control, Accept-Ranges) from the original GET response.
+      return new Response(null, { status: cached.status, headers: cached.headers });
+    }
+
+    // First-time HEAD (no prior GET cached this URL): fall back to R2.
     const head = await env.BUCKET.head(objectName);
     if (!head) return new Response(null, { status: 404 });
     const headers = new Headers();
