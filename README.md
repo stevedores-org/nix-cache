@@ -117,6 +117,17 @@ bunx wrangler deploy   # ship to Cloudflare
 
 Without `UPLOAD_TOKEN`, PUT returns `503 Uploads disabled` — the cache is read-only.
 
+## Operations
+
+Tail logs (including `cache.put` failures — large bodies, transient backpressure, etc.):
+
+```bash
+bunx wrangler tail
+```
+
+A silent `cache.put` failure on a hot object turns every request into a cold R2 read forever, so log entries of the form
+`cache.put failed for <name> (size=<bytes>): <error>` are an early signal worth watching.
+
 ## Generating Cache Keys
 
 ```bash
