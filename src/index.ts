@@ -137,8 +137,19 @@ async function handleRead(
   const response = new Response(object.body, { status, headers });
 
   // Only cache full 200 responses — partials would pollute the edge cache.
+  // Failures (body too large for cache.put, transient backpressure, …) are
+  // logged via console.error so they show up in `wrangler tail`. Without
+  // this, a put that silently fails turns every request into a cold R2 read
+  // forever with no warning.
   if (status === 200) {
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    ctx.waitUntil(
+      cache.put(cacheKey, response.clone()).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(
+          `cache.put failed for ${objectName} (size=${object.size}): ${message}`,
+        );
+      }),
+    );
   }
 
   return response;
