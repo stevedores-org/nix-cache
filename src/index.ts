@@ -70,8 +70,16 @@ async function handleRead(
     return new Response("Not found", { status: 404 });
   }
 
-  // HEAD: use R2.head() — never goes through the body cache.
+  // HEAD: check edge cache for a matching GET response first. If found,
+  // return a body-less 200 with the cached headers. This avoids a round-trip
+  // to R2 for already-warmed hashes.
   if (request.method === "HEAD") {
+    const cacheKey = new Request(url.toString(), { method: "GET" });
+    const cached = await caches.default.match(cacheKey);
+    if (cached) {
+      return new Response(null, { status: 200, headers: cached.headers });
+    }
+
     const head = await env.BUCKET.head(objectName);
     if (!head) return new Response(null, { status: 404 });
     const headers = new Headers();
