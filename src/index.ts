@@ -93,9 +93,8 @@ async function handleRead(
   }
 
   // Parse Range header. Cache stores full 200s only, so any range form
-  // bypasses it and goes to R2 for a 206. Reject multi-range with 416
-  // (was a silent full-body 200 before); accept the suffix form
-  // `bytes=-N` (was treated as no-range, pulling the whole object).
+  // bypasses it and goes to R2 for a 206. Reject multi-range with 416;
+  // accept the suffix form `bytes=-N`.
   const parsedRange = parseRangeHeader(request.headers.get("range"));
   if (parsedRange?.kind === "invalid") {
     return new Response("Range Not Satisfiable", {
@@ -114,23 +113,44 @@ async function handleRead(
     r2Opts.range = { suffix: parsedRange.length };
   }
 
+  // Forward If-None-Match to R2 on full (non-range) GETs only after an edge
+  // cache miss. Warm cache hits stay on the edge path; the conditional
+  // comparison is handled from the cached response headers.
+  const ifNoneMatch = request.headers.get("if-none-match");
+  const conditionalEtag =
+    parsedRange === null && ifNoneMatch ? normalizeEtag(ifNoneMatch) : undefined;
+  if (conditionalEtag) {
+    r2Opts.onlyIf = { etagDoesNotMatch: conditionalEtag };
+  }
+
   // Edge cache: hash-named, immutable full-object GETs only.
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), { method: "GET" });
   if (parsedRange === null) {
     const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      return respondFromCache(cached, conditionalEtag);
+    }
   }
 
   const object = await env.BUCKET.get(objectName, r2Opts);
   if (!object) {
-    // For range requests, R2 returns null both for missing keys AND for
-    // ranges past the end of an existing object. Disambiguate via HEAD so
-    // we can return 416 with a real `Content-Range: bytes */<size>` for
-    // the latter, matching RFC 9110 §15.5.17.
-    if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
-      const head = await env.BUCKET.head(objectName);
-      if (head) {
+    // R2 returns null for missing keys OR ranges past the end of an object
+    // OR if the onlyIf condition failed. Disambiguate via HEAD.
+    const head = await env.BUCKET.head(objectName);
+    if (head) {
+      // Path 1: Conditional GET matched (304).
+      if (conditionalEtag && head.httpEtag === conditionalEtag) {
+        return new Response(null, {
+          status: 304,
+          headers: {
+            etag: head.httpEtag,
+            "Cache-Control": IMMUTABLE_CACHE,
+          },
+        });
+      }
+      // Path 2: Range request was out of bounds (416).
+      if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
         return new Response("Range Not Satisfiable", {
           status: 416,
           headers: {
@@ -154,11 +174,6 @@ async function handleRead(
   if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
     const outcome = resolveRange(parsedRange, object.size);
     if (outcome.kind === "unsatisfiable") {
-      // The range parsed cleanly but the object's actual size makes it
-      // unsatisfiable (e.g. `bytes=N-` with N >= size). Return 416 with
-      // `Content-Range: bytes */<size>` per RFC 9110 §15.5.17. The R2 GET
-      // we just made was the cheapest path to learning object.size (a
-      // separate HEAD would cost the same Class B op).
       return new Response("Range Not Satisfiable", {
         status: 416,
         headers: {
@@ -180,19 +195,8 @@ async function handleRead(
   const response = new Response(object.body, { status, headers });
 
   // Only cache full 200 responses — partials would pollute the edge cache.
-  // Failures (body too large for cache.put, transient backpressure, …) are
-  // logged via console.error so they show up in `wrangler tail`. Without
-  // this, a put that silently fails turns every request into a cold R2 read
-  // forever with no warning.
   if (status === 200) {
-    ctx.waitUntil(
-      cache.put(cacheKey, response.clone()).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          `cache.put failed for ${objectName} (size=${object.size}): ${message}`,
-        );
-      }),
-    );
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
   }
 
   return response;
@@ -343,6 +347,33 @@ export function resolveRange(req: RangeRequest, objectSize: number): RangeOutcom
   if (req.length === 0) return { kind: "unsatisfiable" };
   const length = Math.min(req.length, objectSize);
   return { kind: "satisfied", start: objectSize - length, length };
+}
+
+/**
+ * Decide whether to serve a 304 or return the cached response based on the
+ * client's conditional etag.
+ */
+export function respondFromCache(cached: Response, conditionalEtag?: string): Response {
+  if (conditionalEtag) {
+    const cachedEtag = normalizeEtag(cached.headers.get("etag") ?? "");
+    if (cachedEtag === conditionalEtag) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          etag: cached.headers.get("etag") ?? conditionalEtag,
+          "Cache-Control": IMMUTABLE_CACHE,
+        },
+      });
+    }
+  }
+
+  return cached;
+}
+
+export function normalizeEtag(value: string): string {
+  const stripped = value.replace(/^W\//, "");
+  const m = /^"(.*)"$/.exec(stripped);
+  return m ? m[1] : stripped;
 }
 
 function setContentType(headers: Headers, path: string): void {
