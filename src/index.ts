@@ -84,29 +84,32 @@ async function handleRead(
     return new Response(null, { status: 200, headers });
   }
 
-  // Parse Range header before consulting the cache — cache stores full 200s
-  // only, so any Range request must bypass it and go straight to R2 for a 206.
-  const rangeHeader = request.headers.get("range");
-  let requestedOffset: number | undefined;
-  let requestedLength: number | undefined;
+  // Parse Range header. Cache stores full 200s only, so any range form
+  // bypasses it and goes to R2 for a 206. Reject multi-range with 416
+  // (was a silent full-body 200 before); accept the suffix form
+  // `bytes=-N` (was treated as no-range, pulling the whole object).
+  const parsedRange = parseRangeHeader(request.headers.get("range"));
+  if (parsedRange?.kind === "invalid") {
+    return new Response("Range Not Satisfiable", {
+      status: 416,
+      headers: { "Accept-Ranges": "bytes" },
+    });
+  }
+
   const r2Opts: R2GetOptions = {};
-  if (rangeHeader) {
-    const m = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader);
-    if (m) {
-      requestedOffset = parseInt(m[1], 10);
-      const end = m[2] ? parseInt(m[2], 10) : undefined;
-      if (end !== undefined) requestedLength = end - requestedOffset + 1;
-      r2Opts.range =
-        requestedLength !== undefined
-          ? { offset: requestedOffset, length: requestedLength }
-          : { offset: requestedOffset };
-    }
+  if (parsedRange?.kind === "prefix") {
+    r2Opts.range =
+      parsedRange.length !== undefined
+        ? { offset: parsedRange.offset, length: parsedRange.length }
+        : { offset: parsedRange.offset };
+  } else if (parsedRange?.kind === "suffix") {
+    r2Opts.range = { suffix: parsedRange.length };
   }
 
   // Edge cache: hash-named, immutable full-object GETs only.
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), { method: "GET" });
-  if (requestedOffset === undefined) {
+  if (parsedRange === null) {
     const cached = await cache.match(cacheKey);
     if (cached) return cached;
   }
@@ -122,11 +125,20 @@ async function handleRead(
   headers.set("Accept-Ranges", "bytes");
 
   let status = 200;
-  if (requestedOffset !== undefined) {
-    const length = requestedLength ?? object.size - requestedOffset;
+  if (parsedRange !== null) {
+    let start: number;
+    let length: number;
+    if (parsedRange.kind === "prefix") {
+      start = parsedRange.offset;
+      length = parsedRange.length ?? object.size - start;
+    } else {
+      // suffix: clamp to size when N >= size (RFC 9110 §14.1.2)
+      length = Math.min(parsedRange.length, object.size);
+      start = object.size - length;
+    }
     headers.set(
       "Content-Range",
-      `bytes ${requestedOffset}-${requestedOffset + length - 1}/${object.size}`,
+      `bytes ${start}-${start + length - 1}/${object.size}`,
     );
     headers.set("Content-Length", String(length));
     status = 206;
@@ -199,6 +211,49 @@ function extractAuthToken(authHeader: string | null): string {
 
 function isValidPath(p: string): boolean {
   return NARINFO_RE.test(p) || NAR_RE.test(p);
+}
+
+/**
+ * Parsed shape of an HTTP Range header for a single-range read.
+ *
+ * - `prefix`     — `bytes=N-` or `bytes=N-M`. `length` undefined means "to end".
+ * - `suffix`     — `bytes=-N`. Last N bytes of the object.
+ * - `invalid`    — multi-range, inverted range, or zero-length suffix.
+ *                  Callers MUST respond with 416 Range Not Satisfiable.
+ *
+ * Returns `null` for `null` header or unrecognised malformed syntax,
+ * in which case the caller treats it as no Range header (RFC 9110 §14.2).
+ */
+export type ParsedRange =
+  | { kind: "prefix"; offset: number; length?: number }
+  | { kind: "suffix"; length: number }
+  | { kind: "invalid" };
+
+export function parseRangeHeader(header: string | null): ParsedRange | null {
+  if (!header) return null;
+
+  // Multi-range: a comma anywhere in the byte ranges. We don't support it —
+  // R2 single-range is enough for narinfo/NAR access patterns.
+  if (header.includes(",")) {
+    return { kind: "invalid" };
+  }
+
+  const suffix = /^bytes=-(\d+)$/.exec(header);
+  if (suffix) {
+    const length = parseInt(suffix[1], 10);
+    return length > 0 ? { kind: "suffix", length } : { kind: "invalid" };
+  }
+
+  const single = /^bytes=(\d+)-(\d*)$/.exec(header);
+  if (single) {
+    const offset = parseInt(single[1], 10);
+    if (!single[2]) return { kind: "prefix", offset };
+    const end = parseInt(single[2], 10);
+    if (end < offset) return { kind: "invalid" };
+    return { kind: "prefix", offset, length: end - offset + 1 };
+  }
+
+  return null; // unrecognised — caller treats as no Range
 }
 
 function setContentType(headers: Headers, path: string): void {
