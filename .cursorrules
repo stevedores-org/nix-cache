@@ -1,0 +1,397 @@
+# Cursor IDE Rules (Lornu.ai)
+
+**Authority Chain:** [GEMINI.md](GEMINI.md) → [CODING_STANDARDS.md](CODING_STANDARDS.md) → [.ai/CONVENTIONS.md](.ai/CONVENTIONS.md)
+
+---
+
+## Local CI Validation (MANDATORY)
+
+All contributors must validate their changes locally before pushing or opening a PR.
+
+### How to Validate Locally
+
+**Preferred: Use `just` task runner**
+```bash
+just validate-all     # Complete validation
+just rust-clippy      # Rust linting
+just rust-test        # Run tests
+just yaml-validate    # YAML workflow validation
+```
+
+**Alternative: Use `make` task runner (legacy)**
+```bash
+make test             # Complete validation
+make lci              # Rust workspace checks
+make test-scripts     # Python logic validation
+make test-yaml        # YAML workflow validation
+```
+
+**If neither task runner available:**
+Install actionlint for YAML validation:
+```bash
+brew install actionlint
+```
+
+For details, see [GEMINI.md](GEMINI.md) Section 1 and [LOCAL_CI_VALIDATION.md](docs/LOCAL_CI_VALIDATION.md).
+
+This workflow ensures that all Cursor rules, CI scripts, and YAML workflows are robust and error-free before merging to develop.
+# Grow Without Limits — Cursor Rules (Lornuai, Inc.)
+
+## Scope
+This repo follows **Grow Without Limits (Minimum Viable Infrastructure)**:
+- **Single Azure AKS cluster** (Primary Hub) with **multi-namespace isolation** (`lornu-ai-dev`, `lornu-ai-staging`, `lornu-ai-prod`).
+- **Kustomize overlays** per environment: `lornu-ai-dev`, `lornu-ai-staging`, `lornu-ai-prod`.
+- **Modern runtimes**: Bun (frontend) and uv (backend).
+- **Ecosystem Strategy**: The `lornu-ai` organization consolidates high-value AI/Agentic IP. Infrastructure-only (Terraform-heavy) repos remain in legacy orgs or are archived.
+- **Agent Personas**: Standardized personas for Google AI Studio are stored in `.ai/google-ai-studio/` (e.g., `design-agent.json`).
+
+## **Mandatory Context**
+
+Before starting any task, read these files to understand the current architecture and standards:
+
+### Core Documentation (Root Level)
+1. `AGENTS.md` - Agent capabilities and protocols
+2. `CLAUDE.md` - Build commands and project context
+3. `README.md` - High-level project map and status
+4. `ARCH_PRESERVE.md` - Architecture Preservation Log (Legacy Context)
+5. `.github/copilot-instructions.md` - Copilot-specific guidance
+6. `.github/system-instruction.md` - Sovereign Intelligence standards
+7. `.lornu/STATE.json` - **Shared Agent State** (Check this for active tasks/context)
+8. Global Low-Cost Data Fabric (**GLCDF**) - Sovereign persistence layer
+
+### Architecture Documentation (`.ai/` Directory) - **MANDATORY FOR ALL AGENTS**
+**All agent builders MUST reference these files before generating code:**
+
+9. **`.ai/ARCHITECTURE.md`** - System architecture, directory structure, data flow, and GitOps patterns
+10. **`.ai/AGENT.md`** - Agent instructions, tech stack guidelines (Bun, Rust, dockworker), and mandatory validation rules
+11. **`.ai/CONVENTIONS.md`** - Code conventions for Rust and TypeScript/Bun with examples
+12. **`.ai/TROUBLESHOOTING.md`** - Troubleshooting guide for common errors and fixes
+13. **`.ai/CHECKLIST.md`** - Pre-commit validation checklist and commit message format
+
+**Template Files:**
+- `.ai/templates/rust-agent/` - Template for creating new Rust agents
+- `.ai/templates/bun-app/` - Template for creating new Bun/TypeScript applications
+
+**Configuration Files:**
+- `.ai/Makefile.toml` - cargo-make task runner configuration
+- `.ai/lefthook.toml` - Git hooks configuration
+
+**Usage:** When creating new agents or applications, always reference the templates in `.ai/templates/` and follow the patterns documented in `.ai/ARCHITECTURE.md` and `.ai/AGENT.md`.
+
+## Autonomous Workflow Protocol
+
+When tasked with project maintenance or objective progression, follow this Algorithmic Logic loop:
+
+1. **Poll & Prioritize**:
+   - Use available tools to fetch the latest open GitHub Pull Requests and Issues.
+   - Categorize by impact and urgency.
+
+2. **Analyze & Engage**:
+   - Review each item thoroughly.
+   - Post relevant comments, code reviews, or technical feedback directly to the threads.
+
+3. **Document**:
+   - Update the primary GitHub Issue(s) with a concise summary of progress made and the current status of the objective.
+   - This ensures the "Source of Truth" is always current.
+
+4. **Iterate**:
+   - Identify the next highest-priority action item to maintain momentum.
+   - Propose or initiate the next logical file change or command.
+
+5. **Exception Handling**:
+   - If a task is blocked, requires credentials you lack, or needs human architectural input, **STOP** immediately.
+   - Clearly define the blocker and ask the user for guidance.
+## **Project Standards**
+
+- **Plan A**: Crossplane (Infra), Flux (GitOps), Dockworker (Builds). **Terraform is deprecated.**
+- **CI/CD**: Sovereign Agent Builder on GitLab (`lornu-ai/gitlab-container-builds`).
+- **Workers**: All Cloudflare/Wrangler logic lives in `lornu-ai/automation-hub`.
+- **Runtime**: Bun (frontend), uv (backend). **Bun only for JS/TS — no Node or npm anywhere**; use `bun install`, `bun run`, `bunx` (never npm, npx, yarn, or pnpm).
+
+### OIDC Authentication Standards
+**MANDATORY**: All authentication must use OIDC federation (Zero-Secret Architecture):
+- **AWS**: Use IRSA (IAM Roles for Service Accounts) for EKS pods
+- **GCP**: Use Workload Identity Federation for GKE pods
+- **GitHub Actions**: Use OIDC provider for AWS/GCP authentication
+- **NEVER**: Use static API keys, service account keys, or access tokens
+- **ALWAYS**: Annotate ServiceAccounts with appropriate workload identity annotations
+
+### Flux GitOps Authentication
+This repository is **PRIVATE** and uses **OAuth token authentication** for Flux CD:
+- **GitHub App**: Flux OAuth App (ID: 3313758) - https://github.com/apps/flux-oauth-app
+- **Deploy Keys**: Disabled by lornu-ai organization policy.
+- **OIDC Provider**: AWS IAM OIDC Provider configured for GitHub Actions
+- **Bootstrap**: Always use `--token-auth` flag when bootstrapping Flux.
+
+### Container Images — NEVER Dockerfile (org policy)
+**lornu-ai** and **stevedores-org** use **Nix OCI + dockworker.ai** for images almost since the beginning.
+**Never add, restore, or recommend `Dockerfile` / `Dockerfile.*`, `docker build`, or `docker buildx`.**
+
+| ✅ Always | ❌ Never |
+|-----------|----------|
+| `flake.nix` OCI outputs (`dockerTools`, `nix2container`) | Hand-written Dockerfiles |
+| `dockworker.toml` (`engine = "nix"`) | Dockerfile-based CI publish |
+| `nix build` + `skopeo` / `dockworker push` | Downstream `FROM` chains that bake with Docker |
+
+**Migration**: Nix equivalent first → publish tags → cut consumers → delete Dockerfiles.
+
+### Dockworker.ai Rules
+- **Build Command**: Use `dockworker build --target <target>` — not `docker build`.
+- **Target Definition**: Always refer to `dockworker.toml` for container target definitions.
+- **Validation**: All container build changes must pass `scripts/validate-build-config.py`.
+
+**Build Principle**: **Build Once, Promote Often**. Build container images only on the `develop` branch. Staging and production deployments MUST use the same image SHA from `develop`.
+**PR Base Branch**: All PRs must target `develop` branch. Merges from `develop` → `staging` → `main` are admin-only operations.
+**Promotion Workflow**: Promotions to staging/production are triggered by admin merges, updating the image tags in the overlays.
+
+## Directory Structure (DRY)
+```
+apps/lornu-ai/frontend/                  # React frontend (Bun)
+apps/api/               # Python backend (uv)
+crossplane/hub/azure/       # Azure hub control-plane + infra (Primary)
+crossplane/hub/aws/         # AWS hub control-plane + infra (Secondary)
+crossplane/hub/gcp/         # GCP hub control-plane + infra
+crossplane/spoke/           # Spoke workloads (apps + SQL)
+app-agents/aiops-agent/     # AIOps Agent Auto-Remediation (uv)
+kubernetes/base/            # Legacy source-of-truth manifests
+kubernetes/overlays/        # Environment overlays: dev, staging, prod
+```
+
+## Satellite Repositories (Automation Services)
+
+**Cloudflare Workers** are managed in separate repositories:
+- **automation-hub**: [lornu-ai/automation-hub](https://github.com/lornu-ai/automation-hub)
+  - Workers: `automation-hub` (CI automation), `lornu-edge-discovery` (Hyperdrive-based agent discovery)
+  - **Private RAG (Issue #565)**: R2 bucket + Vectorize for agent knowledge grounding
+    - Endpoints: `/api/rag/search`, `/api/vectorize/trigger`, `/api/vectorize/status`
+    - R2 Bucket: `lornu-private-rag-prod`
+    - Vectorize Index: `lornu-private-knowledge` (768 dims, bge-base-en-v1.5)
+  - Deployment: Wrangler CLI (`wrangler deploy`)
+  - Related: Issue #589 (Edge Discovery), Issue #542 (CI Automation), Issue #565 (Private RAG)
+
+**GitLab CI/CD** configurations are managed separately:
+- **gitlab-container-builds**: [lornu-ai/gitlab-container-builds](https://github.com/lornu-ai/gitlab-container-builds)
+  - Purpose: GitLab CI/CD pipelines for container builds and multi-cloud mirroring
+  - Related: GitLab pull mirroring (see `docs/GITLAB_MIRROR_SETUP.md`)
+
+**Note**: Cloudflare Workers and GitLab CI code should NOT be added to this repository. Use the satellite repositories listed above.
+
+## Kubernetes Standards
+- Always use **Kustomize**. Add shared resources to `crossplane/spoke/apps/` and patch per env in overlays.
+- Namespaces: `lornu-ai-dev`, `lornu-ai-staging`, `lornu-ai-prod`.
+- **Protective Metadata**:
+  - `lornu.ai/environment`: `development` | `staging` | `production` (REQUIRED on all resources)
+  - `lornu.ai/managed-by`: `crossplane` | `terraform-cloud` | `flux` (REQUIRED on all resources)
+  - `lornu.ai/asset-id`: `logo` (OPTIONAL - only for asset-serving resources like ConfigMaps containing logos)
+- Use `lornu-ai-` prefix for resource names.
+
+## Runtime Standards
+- **Frontend**: Bun (`bun install`, `bun run dev`, `bunx`). Template: `lornu-ai/react-bun-k8s`. Working dir: `apps/lornu-ai/frontend`.
+- **Backend**: uv only (`uv sync`, `uv run uvicorn`).
+- **Core Logic**: Rust ONLY for new `apps`, `app-agents`, and `packages` (Rust-or-Bust policy). Every new component MUST include a `Cargo.toml`.
+- Do **not** use npm/yarn/pip.
+
+## CI/CD Quality Gates (Grow Without Limits)
+- **Level 1: Kustomize Build**: All overlays must pass `kustomize build`.
+- **Level 2: Schema Validation**: All resources must pass `kubeconform`.
+- **Level 3: Security Scan**: All manifests must pass `Checkov`.
+- **Secret Scanning**: All commits must pass `Gitleaks`.
+- **Label Compliance**: All resources must have mandatory `lornu.ai/*` labels.
+- **Unit Test Coverage**: Changed components must have at least 75% unit test coverage.
+
+## Declarative GitOps Policy (MANDATORY)
+**CROSSPLANE IS A CONTROL PLANE - "SET IT AND FORGET IT"**
+- **❌ NEVER use imperative commands** (`kubectl apply/patch/edit`) to modify infrastructure.
+- **✅ ALWAYS use declarative GitOps**: YAML → Commit PR → Flux/ArgoCD → Crossplane.
+- **Workflow**: Agent → Git PR (YAML) → Flux/ArgoCD → Crossplane → AWS/GCP.
+
+## Commands (Local Only)
+```bash
+# Local development only (NOT for infrastructure)
+make build          # Build container image
+make deploy-local   # Local Kubernetes deploy
+cd apps/lornu-ai/frontend && bun run dev
+cd apps/api && uv run uvicorn src.main:app && uv run mypy src tests
+cd app-agents/aiops-agent && uv sync && uv run python -m aiops_agent.main
+```
+
+## Pre-Flight Check: The 7-File Rule (MANDATORY)
+**Before completing ANY task, verify if these 7 core documentation files need updates:**
+
+1. **`.cursorrules`** - Local IDE rules
+2. **`AGENTS.md`** - Agent capabilities
+3. **`CLAUDE.md`** - External LLM context
+4. **`README.md`** - Project map
+5. **`ARCH_PRESERVE.md`** - Architecture Preservation Log
+6. **`.github/copilot-instructions.md`** - Copilot instructions
+7. **`.github/system-instruction.md`** - System instructions
+
+**Infrastructure Changes**: Always follow `docs/DECLARATIVE_GITOPS_POLICY.md` - generate YAML, commit via PR, let GitOps handle it.
+
+## Agent Workflow (Autonomous Operation Loop)
+
+When working autonomously, follow this algorithmic loop:
+
+1. **Poll & Prioritize**: Fetch the latest open GitHub Pull Requests and Issues.
+2. **Analyze & Engage**: Review each item and post relevant comments or actionable feedback.
+3. **Document**: Update the primary GitHub Issue(s) with a concise summary of progress made and current status.
+4. **Iterate**: Identify the next highest-priority action item to maintain momentum.
+5. **Exception Handling**: If a task is blocked or requires human input, stop and ask for guidance immediately.
+
+**Why this matters:**
+- Prevents "Instruction Drift" where agents use outdated schemas or patterns
+- Ensures all AI assistants (Cursor, Windsurf, Copilot) read the same updated truth
+- Enables LibrarianAgent and other workers to operate with perfect context
+
+**When to update:**
+- New features added to `apps/lornu-ai/frontend/` or `apps/api/`
+- Changes to deployment patterns, build commands, or infrastructure
+- New standards, conventions, or governance policies
+- Updates to agent capabilities or A2A Protocol
+
+**Pre-flight Check**: Before completing any task, verify these files reflect your changes. If your changes affect:
+- Build/test commands → Update `CLAUDE.md`
+- Agent capabilities → Update `AGENTS.md`
+- Project structure → Update `README.md`
+- IDE workflows → Update `.cursorrules`
+- Agent instructions → Update `.github/copilot-instructions.md` or `.github/system-instruction.md`
+
+**Automation**: The `LibrarianAgent` automatically scans and suggests updates for these files. Use `check-documentation-sync` MCP tool to validate sync status.
+
+## PR Labeling (ALWAYS Required)
+- **MANDATORY**: Apply a label for the **worker/agent** (e.g., `codex`, `vs-code`, `antigravity`, `claude`, `cursor-ide`, `jules`) to every PR
+- If the label doesn't exist, create it first: `gh label create <agent-name>`
+- Apply to PR: `gh pr edit <pr-number> --add-label <agent-name>`
+- **Purpose**: Enables SRE Agent to correlate incident resolution speed with specific AI tools
+- **Access PRs/Issues**: Use `gh` CLI (`gh pr view/edit`, `gh issue view`) for reviews and issue context
+
+## Sensitive Data Masking (MANDATORY)
+- **NEVER** commit AWS Account IDs, GCP Project IDs, GCP Org IDs, or other sensitive identifiers in plaintext
+- **NEVER** hardcode 12-digit AWS Account IDs or 12-digit GCP Org IDs
+- **ALWAYS** use `${VAR}` syntax for variable substitution (e.g., `${GCP_ORG_ID}`, `${AWS_ACCOUNT_ID}`, `${GCP_PROJECT_ID}`)
+- Replace at runtime using Flux `postBuild` substitution with `substituteFrom` (ESO-managed secrets)
+- **Example**: `orgId: "${GCP_ORG_ID}"` (not `orgId: "GCP_ORG_ID_PLACEHOLDER"`)
+- **Example**: `arn:aws:iam::${AWS_ACCOUNT_ID}:role/lornu-ai-role` (not `arn:aws:iam::AWS_ACCOUNT_ID_PLACEHOLDER:role/lornu-ai-role`)
+- Gitleaks will block commits with sensitive data patterns
+
+## Flux-Native Validation (Automatic CI)
+- **Flux automatically detects code changes** and runs validation in-cluster (no GitHub Actions needed)
+- **GitRepository** polls Git every 1 minute automatically
+- **Kustomization with `validation: server`** validates resources using cluster API
+- **Alert Provider** posts results to GitHub PR Checks tab automatically
+- **ESO Resource Validation**: ExternalSecret in `flux-system` namespace MUST use `ClusterSecretStore` (not `SecretStore`)
+- See `docs/FLUX_NATIVE_CI.md` for complete guide on Flux automatic validation
+
+## PR Base Branch (Required)
+
+**Enforced Flow**: `develop` → `staging` → `main`
+
+- **Feature branches**: Always open PRs against `develop`
+- **Promotion to staging**: PRs to `staging` must come from `develop` only (admin)
+- **Promotion to production**: PRs to `main` must come from `staging` only (admin)
+
+This flow is enforced by CI - PRs that don't follow this pattern will be blocked.
+
+## Coding Style
+- **Python**: Use `uv` for dependency management. Follow PEP 8. Use type hints. Use `typing.cast` for return statements where type inference is ambiguous to maintain strict type safety (Issue #528).
+- **TypeScript/React**: Use `bun` only (no Node/npm). Functional components with hooks. Strong typing.
+  - **Context Enforcement**: All UI components requiring context (e.g., `Toaster`, `Tooltip`) MUST be rendered within their respective providers (typically within `ThemeProvider` in `App.tsx`).
+  - **Discriminated Unions**: Use discriminated unions for complex component props (e.g., `FooterLink` with mutually exclusive `to` and `href`) to ensure type safety.
+- **Kubernetes**: Kustomize overlays. Declarative manifests. No imperative `kubectl`.
+
+## Security
+- **Zero-Secret**: No hardcoded secrets. Use ESO (External Secrets Operator).
+- **PII**: Redact PII using `apps/api/src/core/privacy.py`.
+- **Images**: Use Dockworker for SLSA provenance and SBOMs.
+
+## Terraform Hygiene (Deprecated)
+- Terraform has been fully migrated to Crossplane. Legacy Terraform directories remain for reference only.
+- For infrastructure changes, use Crossplane resources in `crossplane/aws/hub/infra/` or `crossplane/gcp/hub/infra/`.
+
+## Git & Cloud Authentication (Mandatory: OIDC / WIF)
+- **OIDC-First**: All cloud authentication must use OIDC-based federation. Static keys are strictly prohibited.
+- **Deploy Keys Disabled**: Do not use SSH deploy keys. Organization policy enforces OAuth/OIDC.
+- **Flux Bootstrapping**: Use `flux bootstrap github --token-auth` (HTTPS).
+- **Workload Identity**: Always prefer IRSA (AWS) or Workload Identity (GCP) for cluster workloads.
+
+## Governance-Aware Development (GAC)
+- **Validation**: Developers MUST validate resource changes using `GACAgent.validate_governance()`.
+- **Sensitive Data**: Use Pydantic models and regex scanning for all user inputs.
+- **Audit**: Verify `log_audit_event()` triggers on critical actions.
+
+## Branding
+- Brand asset: `apps/web/src/assets/brand/logo.png`
+
+- **AWS (Primary Hub)**: EKS `<AWS_EKS_CLUSTER_NAME>` (us-east-2) - Active Hub Control Plane
+- **GCP**: 
+  - GKE cluster `<GCP_GKE_CLUSTER_NAME>` (us-central1) - **Operational / Staging Hub**.
+  - GKE cluster `lornu-cluster-west2` (us-west2) - **Secondary Region / Production Spoke**.
+
+## Flux GitHub Authentication
+- **Method**: GitHub App (OAuth) - not deploy keys or SSH
+- **GitHub App**: `https://github.com/organizations/lornu-ai/settings/applications/3313758`
+- **Secret**: `flux-github-auth` in `flux-system` namespace
+- **Policy**: Deploy keys disabled by organization policy
+
+## Do Not Reference
+- AWS ECS (use EKS instead).
+- **Cloudflare Workers**: All worker logic (Wrangler) is consolidated in `lornu-ai/automation-hub`. Do not add new workers to this monorepo.
+- **GitLab CI**: Templates and centralized builders reside in `lornu-ai/gitlab-container-builds`.
+- Helm charts, templates, or values files (Helm is deprecated).
+- Deploy keys or SSH authentication for Flux (uses GitHub App OAuth instead).
+
+- All asset serving is handled by Kubernetes Ingress (ALB on AWS, GCE on GCP).
+- All API routes are handled by the FastAPI backend in `packages/api/`.
+
+### PR Policy (Required)
+- **Target Branch**: Always open PRs against `develop`.
+- **Merges to Main**: Merges to `staging` and `main` are handled separately by an admin for integration and production releases.
+- **Labeling**: Apply a worker/agent label (e.g., `antigravity`, `claude`, `gemini-cli`) to every PR for traceability.
+
+**Enforced Flow**: `develop` → `staging` → `main`
+
+- **Feature branches**: Always open PRs against `develop`
+- **Promotion to staging**: PRs to `staging` must come from `develop` only (admin)
+- **Promotion to production**: PRs to `main` must come from `staging` only (admin)
+- **Labeling**: Apply the agent/worker label (e.g., `gemini-cli`, `claude`, `cursor-ide`) to all PRs
+
+This flow is enforced by CI - PRs that don't follow this pattern will be blocked.
+
+## Official Contact Information (MANDATORY)
+
+- **Official Email**: `contact@lornu.ai` - This is the ONLY email address that should be published in any documentation, UI, or external communications.
+- **NEVER** publish any other email addresses (personal, team, or alternative domains).
+- This policy ensures consistent branding and proper routing of all external communications to Lornuai, Inc.
+
+## Poll & Prioritize Workflow (MANDATORY)
+
+**Before starting any new task, follow this workflow:**
+
+1. **Poll & Prioritize**: Fetch the latest open GitHub Pull Requests and Issues.
+   - Use `gh pr list --state open` and `gh issue list --state open` to get current items
+   - Sort by creation date (oldest first) to prioritize backlog items
+   - Identify items that need immediate attention or are blocked
+
+2. **Analyze & Engage**: Review each item and post relevant comments or feedback.
+   - Read PR descriptions and issue details
+   - Check for related work or dependencies
+   - Add helpful comments with context, suggestions, or status updates
+   - Link related PRs/issues when relevant
+
+3. **Document**: Update the primary GitHub Issue(s) with a concise summary of progress made and current status.
+   - Post summary comments to relevant issues using `gh issue comment`
+   - Include what was completed, what's in progress, and what's blocked
+   - Reference related PRs and commits
+   - Use consistent formatting: `⏺ **Summary Title**` followed by bullet points
+
+4. **Iterate**: Identify the next highest-priority action item to maintain momentum.
+   - Choose the most impactful task that's unblocked
+   - Consider dependencies and prerequisites
+   - Balance quick wins with larger initiatives
+
+5. **Exception Handling**: If a task is blocked or requires human input, stop and ask for guidance immediately.
+   - Don't proceed with assumptions when blocked
+   - Clearly state what's blocking and what information is needed
+   - Wait for explicit direction before continuing
+
+**Purpose**: Ensures continuous engagement with the repository's active work, prevents duplicate effort, and maintains visibility into progress across all initiatives.
