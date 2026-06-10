@@ -4,13 +4,36 @@
  * Implements a Nix-compatible binary cache backed by Cloudflare R2.
  * Serves .narinfo and .nar files with edge caching, range requests,
  * Ed25519 signature verification on uploads, and constant-time
- * token auth.
+ * token auth. Optional KV-backed counters surface at /metrics
+ * (gated by UPLOAD_TOKEN).
  */
 
 export interface Env {
   BUCKET: R2Bucket;
   UPLOAD_TOKEN?: string;
   NIX_PUBLIC_KEY?: string;
+  // Optional KV binding for hit/miss/put/auth counters. When unset, all
+  // metric increments are no-ops and /metrics returns zeros. Operators
+  // who don't want counters can simply not provision the namespace.
+  METRICS?: KVNamespace;
+}
+
+type MetricKey = "get_hit" | "get_miss" | "put_ok" | "auth_fail";
+const METRIC_KEYS: readonly MetricKey[] = ["get_hit", "get_miss", "put_ok", "auth_fail"];
+
+// Counter increment is best-effort and non-atomic — KV `get` then `put` races
+// across concurrent requests. We accept under-counting (bounded by request
+// concurrency) for cache-observability use; this is not for billing. Use
+// Workers Analytics Engine or a Durable Object if exact counts matter.
+async function incMetric(kv: KVNamespace | undefined, key: MetricKey): Promise<void> {
+  if (!kv) return;
+  try {
+    const val = parseInt((await kv.get(key)) ?? "0", 10);
+    await kv.put(key, String(val + 1));
+  } catch (err: unknown) {
+    // Don't let metric failures break request handling.
+    console.error(`incMetric(${key}) failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 const NIX_CACHE_INFO = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
@@ -55,9 +78,30 @@ export default {
       });
     }
 
+    if (path === "/metrics") {
+      // Reuses UPLOAD_TOKEN — both write paths and the observability surface
+      // belong to the deploy operator. Treating these as the same auth
+      // boundary avoids juggling a second secret. If you do want them split,
+      // add a METRICS_TOKEN env and gate the bearer check on that instead.
+      if (!env.UPLOAD_TOKEN) {
+        return new Response("Metrics disabled", { status: 503 });
+      }
+      const provided = extractAuthToken(request.headers.get("authorization"));
+      if (!provided || !constantTimeEqual(provided, env.UPLOAD_TOKEN)) {
+        ctx.waitUntil(incMetric(env.METRICS, "auth_fail"));
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const counters: Record<string, number> = {};
+      for (const key of METRIC_KEYS) {
+        counters[key] = parseInt((await env.METRICS?.get(key)) ?? "0", 10);
+      }
+      counters.get_total = counters.get_hit + counters.get_miss;
+      return Response.json(counters);
+    }
+
     const method = request.method;
     if (method === "GET" || method === "HEAD") return handleRead(request, env, ctx);
-    if (method === "PUT") return handleUpload(request, env);
+    if (method === "PUT") return handleUpload(request, env, ctx);
 
     return new Response("Method not allowed", {
       status: 405,
@@ -66,15 +110,12 @@ export default {
   },
 };
 
-async function handleRead(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-): Promise<Response> {
+async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const objectName = url.pathname.slice(1);
 
   if (!isValidPath(objectName)) {
+    ctx.waitUntil(incMetric(env.METRICS, "get_miss"));
     return new Response("Not found", { status: 404 });
   }
 
@@ -87,9 +128,7 @@ async function handleRead(
     // can't use HEAD as a freshness probe — they have to issue a GET and
     // discard the body.
     const headIfNoneMatch = request.headers.get("if-none-match");
-    const headConditionalEtag = headIfNoneMatch
-      ? normalizeEtag(headIfNoneMatch)
-      : undefined;
+    const headConditionalEtag = headIfNoneMatch ? normalizeEtag(headIfNoneMatch) : undefined;
 
     const cacheKey = new Request(url.toString(), { method: "GET" });
     const cached = await caches.default.match(cacheKey);
@@ -97,6 +136,7 @@ async function handleRead(
       if (headConditionalEtag) {
         const cachedEtag = normalizeEtag(cached.headers.get("etag") ?? "");
         if (cachedEtag === headConditionalEtag) {
+          ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
           return new Response(null, {
             status: 304,
             headers: {
@@ -106,13 +146,18 @@ async function handleRead(
           });
         }
       }
+      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return new Response(null, { status: 200, headers: cached.headers });
     }
 
     const head = await env.BUCKET.head(objectName);
-    if (!head) return new Response(null, { status: 404 });
+    if (!head) {
+      ctx.waitUntil(incMetric(env.METRICS, "get_miss"));
+      return new Response(null, { status: 404 });
+    }
 
     if (headConditionalEtag && normalizeEtag(head.httpEtag) === headConditionalEtag) {
+      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return new Response(null, {
         status: 304,
         headers: {
@@ -129,6 +174,7 @@ async function handleRead(
     headers.set("Cache-Control", IMMUTABLE_CACHE);
     headers.set("Content-Length", String(head.size));
     headers.set("Accept-Ranges", "bytes");
+    ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
     return new Response(null, { status: 200, headers });
   }
 
@@ -155,8 +201,7 @@ async function handleRead(
   // cache miss. Warm cache hits stay on the edge path; the conditional
   // comparison is handled from the cached response headers.
   const ifNoneMatch = request.headers.get("if-none-match");
-  const conditionalEtag =
-    parsedRange === null && ifNoneMatch ? normalizeEtag(ifNoneMatch) : undefined;
+  const conditionalEtag = parsedRange === null && ifNoneMatch ? normalizeEtag(ifNoneMatch) : undefined;
   if (conditionalEtag) {
     r2Opts.onlyIf = { etagDoesNotMatch: conditionalEtag };
   }
@@ -167,6 +212,7 @@ async function handleRead(
   if (parsedRange === null) {
     const cached = await cache.match(cacheKey);
     if (cached) {
+      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return respondFromCache(cached, conditionalEtag);
     }
   }
@@ -179,6 +225,7 @@ async function handleRead(
     if (head) {
       // Path 1: Conditional GET matched (304).
       if (conditionalEtag && head.httpEtag === conditionalEtag) {
+        ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
         return new Response(null, {
           status: 304,
           headers: {
@@ -189,9 +236,11 @@ async function handleRead(
       }
       // Path 2: Range request was out of bounds (416).
       if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
+        ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
         return rangeNotSatisfiable(head.size);
       }
     }
+    ctx.waitUntil(incMetric(env.METRICS, "get_miss"));
     return new Response("Not found", { status: 404 });
   }
 
@@ -206,12 +255,10 @@ async function handleRead(
   if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
     const outcome = resolveRange(parsedRange, object.size);
     if (outcome.kind === "unsatisfiable") {
+      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return rangeNotSatisfiable(object.size);
     }
-    headers.set(
-      "Content-Range",
-      `bytes ${outcome.start}-${outcome.start + outcome.length - 1}/${object.size}`,
-    );
+    headers.set("Content-Range", `bytes ${outcome.start}-${outcome.start + outcome.length - 1}/${object.size}`);
     headers.set("Content-Length", String(outcome.length));
     status = 206;
   } else {
@@ -219,6 +266,7 @@ async function handleRead(
   }
 
   const response = new Response(object.body, { status, headers });
+  ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
 
   // Only cache full 200 responses — partials would pollute the edge cache.
   // Two failure modes, two defences:
@@ -231,16 +279,12 @@ async function handleRead(
   // Path A (R2 Custom Domain for /nar/*) is the longer-term fix for (1).
   if (status === 200) {
     if (object.size >= CACHE_PUT_BYTE_LIMIT) {
-      console.log(
-        `cache.put skipped for ${objectName} (size=${object.size} >= limit=${CACHE_PUT_BYTE_LIMIT})`,
-      );
+      console.log(`cache.put skipped for ${objectName} (size=${object.size} >= limit=${CACHE_PUT_BYTE_LIMIT})`);
     } else {
       ctx.waitUntil(
         cache.put(cacheKey, response.clone()).catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err);
-          console.error(
-            `cache.put failed for ${objectName} (size=${object.size}): ${message}`,
-          );
+          console.error(`cache.put failed for ${objectName} (size=${object.size}): ${message}`);
         }),
       );
     }
@@ -249,13 +293,14 @@ async function handleRead(
   return response;
 }
 
-async function handleUpload(request: Request, env: Env): Promise<Response> {
+async function handleUpload(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (!env.UPLOAD_TOKEN) {
     return new Response("Uploads disabled", { status: 503 });
   }
 
   const provided = extractAuthToken(request.headers.get("authorization"));
   if (!provided || !constantTimeEqual(provided, env.UPLOAD_TOKEN)) {
+    ctx.waitUntil(incMetric(env.METRICS, "auth_fail"));
     return new Response("Unauthorized", { status: 401 });
   }
 
@@ -284,6 +329,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     await env.BUCKET.put(objectName, request.body, { httpMetadata });
   }
 
+  ctx.waitUntil(incMetric(env.METRICS, "put_ok"));
   return new Response("OK", { status: 201 });
 }
 
@@ -376,9 +422,7 @@ export function parseRangeHeader(header: string | null): ParsedRange | null {
  * `resolveRange` accepts this narrowed type so the unsatisfiable detection
  * is purely about size, not syntax.
  */
-export type RangeRequest =
-  | { kind: "prefix"; offset: number; length?: number }
-  | { kind: "suffix"; length: number };
+export type RangeRequest = { kind: "prefix"; offset: number; length?: number } | { kind: "suffix"; length: number };
 
 /**
  * Result of intersecting a parsed range with the object's actual size.
@@ -395,9 +439,7 @@ export type RangeRequest =
  * per RFC 9110 §14.1.2. For suffix ranges where N >= size, the whole object
  * is served.
  */
-export type RangeOutcome =
-  | { kind: "satisfied"; start: number; length: number }
-  | { kind: "unsatisfiable" };
+export type RangeOutcome = { kind: "satisfied"; start: number; length: number } | { kind: "unsatisfiable" };
 
 export function resolveRange(req: RangeRequest, objectSize: number): RangeOutcome {
   // RFC 9110 §14.1.2: a byte-range-set is satisfiable iff at least one spec
@@ -406,10 +448,7 @@ export function resolveRange(req: RangeRequest, objectSize: number): RangeOutcom
 
   if (req.kind === "prefix") {
     if (req.offset >= objectSize) return { kind: "unsatisfiable" };
-    const end =
-      req.length !== undefined
-        ? Math.min(req.offset + req.length - 1, objectSize - 1)
-        : objectSize - 1;
+    const end = req.length !== undefined ? Math.min(req.offset + req.length - 1, objectSize - 1) : objectSize - 1;
     return { kind: "satisfied", start: req.offset, length: end - req.offset + 1 };
   }
   // suffix
@@ -474,13 +513,7 @@ async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolea
       return false;
     }
     if (raw.length !== 32) return false;
-    const key = await crypto.subtle.importKey(
-      "raw",
-      raw,
-      { name: "Ed25519" },
-      false,
-      ["verify"],
-    );
+    const key = await crypto.subtle.importKey("raw", raw, { name: "Ed25519" }, false, ["verify"]);
     publicKeyCache = { keyName, key };
   }
 
@@ -514,12 +547,7 @@ async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolea
     } catch {
       continue;
     }
-    const ok = await crypto.subtle.verify(
-      { name: "Ed25519" },
-      publicKeyCache.key,
-      sigBytes,
-      fingerprintBytes,
-    );
+    const ok = await crypto.subtle.verify({ name: "Ed25519" }, publicKeyCache.key, sigBytes, fingerprintBytes);
     if (ok) return true;
   }
   return false;

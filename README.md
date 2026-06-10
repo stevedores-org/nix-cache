@@ -37,6 +37,52 @@ This workflow ensures that all documentation and YAML workflows are robust and e
 ## Agent Pre-Commit
 
 All agents must run the repo pre-commit checks before committing changes.
+
+## HTTP API
+
+The worker exposes a small surface area:
+
+| Method | Path                | Auth     | Notes                                                          |
+| ------ | ------------------- | -------- | -------------------------------------------------------------- |
+| GET    | `/nix-cache-info`   | none     | Standard Nix cache info document.                              |
+| GET    | `/health`           | none     | Liveness probe; returns JSON `{status, cache, timestamp}`.     |
+| GET    | `/<hash>.narinfo`   | none     | Read a narinfo. Honours `If-None-Match` (304) and `Range`.     |
+| GET    | `/nar/<hash>.nar*`  | none     | Read a NAR. Range-aware.                                       |
+| HEAD   | (same as GET)       | none     | RFC 9110 §13.1.2-compliant — `If-None-Match` → 304 when matched. |
+| PUT    | `/<hash>.narinfo`   | bearer   | Upload narinfo. Verified against `NIX_PUBLIC_KEY` if set.      |
+| PUT    | `/nar/<hash>.nar*`  | bearer   | Upload NAR.                                                    |
+| GET    | `/metrics`          | bearer   | Optional KV-backed counters. See below.                        |
+
+### `/metrics`
+
+When the optional `METRICS` KV namespace is bound, the worker increments
+four eventually-consistent counters from request handlers:
+
+| Key          | Incremented on                                          |
+| ------------ | ------------------------------------------------------- |
+| `get_hit`    | Any successful read (200, 206, 304, edge-cache hits, range 416). |
+| `get_miss`   | Read for an object that does not exist in R2 (404).     |
+| `put_ok`     | Successful uploads (201).                               |
+| `auth_fail`  | `/metrics` or upload requests with missing/wrong bearer (401). |
+
+`GET /metrics` returns these as JSON plus a derived `get_total = get_hit +
+get_miss`, behind the same `UPLOAD_TOKEN` bearer auth as PUT. Without the
+KV binding the endpoint still returns 200 with all-zero counters (provided
+`UPLOAD_TOKEN` is set), and all increments are no-ops — there is no failure
+mode for operators who don't want the observability layer.
+
+To enable:
+
+```bash
+wrangler kv namespace create nix-cache-metrics
+# paste the returned id into wrangler.toml under the commented
+# [[kv_namespaces]] METRICS block, then redeploy.
+```
+
+The counters race under concurrent writes (KV `get`-then-`put`) so the
+numbers are a directional signal, not exact. For exact accounting, switch
+to Workers Analytics Engine or a Durable Object.
+
 # **Grow Without Limits — Lornuai, Inc.**
 
 ## ---
