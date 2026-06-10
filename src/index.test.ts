@@ -1,6 +1,6 @@
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "bun:test";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Minimal R2Object stub
 function makeR2Object(body: string, key: string) {
@@ -23,6 +23,18 @@ function makeBucket() {
       const val = store.get(key);
       if (!val) return null;
       return makeR2Object(val, key);
+    },
+    async head(key: string) {
+      const val = store.get(key);
+      if (!val) return null;
+      return {
+        key,
+        size: val.length,
+        httpEtag: `"${key}-etag"`,
+        writeHttpMetadata(headers: Headers) {
+          headers.set("Content-Type", "application/octet-stream");
+        },
+      };
     },
     async put(key: string, body: ReadableStream | string | null) {
       const text = typeof body === "string" ? body : body ? await new Response(body).text() : "";
@@ -61,6 +73,22 @@ describe("nix-cache worker", () => {
 
   beforeEach(() => {
     env = makeEnv();
+    const cacheStore = new Map<string, Response>();
+    const keyOf = (req: Request | string) => (typeof req === "string" ? req : req.url);
+    (globalThis as unknown as Record<string, unknown>).caches = {
+      default: {
+        async match(req: Request | string): Promise<Response | undefined> {
+          const r = cacheStore.get(keyOf(req));
+          return r ? r.clone() : undefined;
+        },
+        async put(req: Request | string, res: Response): Promise<void> {
+          cacheStore.set(keyOf(req), res.clone());
+        },
+        async delete(req: Request | string): Promise<boolean> {
+          return cacheStore.delete(keyOf(req));
+        },
+      },
+    };
   });
 
   describe("GET /nix-cache-info", () => {
@@ -375,16 +403,16 @@ describe("nix-cache worker", () => {
       // Generate some activity: 1 hit, 1 miss, 1 put, 1 auth fail
       await worker.fetch(new Request("https://nix-cache.stevedores.org/miss.narinfo"), env);
       await worker.fetch(
-        new Request("https://nix-cache.stevedores.org/obj", {
+        new Request("https://nix-cache.stevedores.org/obj.narinfo", {
           method: "PUT",
           body: "data",
           headers: { Authorization: "Bearer test-secret-token" },
         }),
         env,
       );
-      await worker.fetch(new Request("https://nix-cache.stevedores.org/obj"), env);
+      await worker.fetch(new Request("https://nix-cache.stevedores.org/obj.narinfo"), env);
       await worker.fetch(
-        new Request("https://nix-cache.stevedores.org/obj", {
+        new Request("https://nix-cache.stevedores.org/obj.narinfo", {
           method: "PUT",
           body: "x",
           headers: { Authorization: "Bearer bad" },
