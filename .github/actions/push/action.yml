@@ -1,0 +1,48 @@
+name: "Push to Nix Cache"
+description: "Sign and upload store paths to nix-cache.stevedores.org"
+
+inputs:
+  paths:
+    description: "Space-separated Nix store paths or flake refs to push (e.g., .#default or /nix/store/...)"
+    required: true
+  signing-secret-key:
+    description: "Ed25519 secret key for signing (reads from /tmp/nix-sign-key if setup action was used)"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Sign and push to cache
+      shell: bash
+      run: |
+        KEY_FILE="/tmp/nix-sign-key"
+        if [ -n "${{ inputs.signing-secret-key }}" ]; then
+          echo "${{ inputs.signing-secret-key }}" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+        fi
+
+        if [ ! -f "$KEY_FILE" ]; then
+          echo "::error::No signing key found. Run setup action with push=true first, or pass signing-secret-key."
+          exit 1
+        fi
+
+        for path in ${{ inputs.paths }}; do
+          echo "::group::Pushing $path"
+
+          # Resolve flake ref to store path if needed
+          if [[ "$path" == .#* ]] || [[ "$path" == *#* ]]; then
+            STORE_PATH=$(nix build "$path" --no-link --print-out-paths 2>/dev/null || echo "")
+            if [ -z "$STORE_PATH" ]; then
+              echo "::warning::Could not resolve $path — skipping"
+              echo "::endgroup::"
+              continue
+            fi
+          else
+            STORE_PATH="$path"
+          fi
+
+          nix store sign --key-file "$KEY_FILE" "$STORE_PATH"
+          nix copy --to "https://nix-cache.stevedores.org" "$STORE_PATH"
+          echo "Pushed: $STORE_PATH"
+          echo "::endgroup::"
+        done

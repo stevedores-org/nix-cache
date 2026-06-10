@@ -3,21 +3,61 @@
  *
  * Implements a Nix-compatible binary cache backed by Cloudflare R2.
  * Serves .narinfo and .nar files with edge caching, range requests,
- * Ed25519 signature verification on uploads, and constant-time
- * token auth.
+ * Ed25519 signature verification on uploads, constant-time token auth,
+ * and Cloudflare KV-backed metrics.
+ * GET is public (serves .narinfo and .nar files).
+ * PUT requires Bearer token authentication.
+ * /metrics returns JSON counters (authenticated).
  */
 
 export interface Env {
   BUCKET: R2Bucket;
   UPLOAD_TOKEN?: string;
+  CACHE_AUTH_TOKEN?: string;
   NIX_PUBLIC_KEY?: string;
+  METRICS?: KVNamespace;
+}
+
+type MetricKey = "get_hit" | "get_miss" | "put_ok" | "auth_fail";
+
+async function incMetric(kv: KVNamespace | undefined, key: MetricKey): Promise<void> {
+  if (!kv) return;
+  const val = parseInt((await kv.get(key)) || "0", 10);
+  await kv.put(key, String(val + 1));
+}
+
+function jsonError(message: string, status: number): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function bearerAuth(request: Request, env: Env): Response | null {
+  const token = env.CACHE_AUTH_TOKEN || env.UPLOAD_TOKEN;
+  if (!token) {
+    return jsonError("Server misconfigured: no auth token set", 500);
+  }
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader) {
+    return jsonError("Missing Authorization header", 401);
+  }
+  const parts = authHeader.split(" ");
+  if (parts.length !== 2 || parts[0] !== "Bearer" || !parts[1]) {
+    return jsonError("Authorization must use Bearer scheme", 401);
+  }
+  const provided = parts[1];
+  if (!constantTimeEqual(provided, token)) {
+    return jsonError("Invalid token", 403);
+  }
+  return null;
 }
 
 const NIX_CACHE_INFO = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
 
 // Hash-named paths only — keeps the bucket clean and prevents path injection.
-const NARINFO_RE = /^[0-9a-z]{32}\.narinfo$/;
-const NAR_RE = /^nar\/[0-9a-z]{52}(-[0-9a-z+._-]+)?\.nar(\.(xz|zst|bz2|br))?$/;
+const NARINFO_RE = /^(?:[a-zA-Z0-9._-]+\/)?[a-zA-Z0-9._-]+\.narinfo$/;
+const NAR_RE = /^(?:[a-zA-Z0-9._-]+\/)?nar\/[a-zA-Z0-9._-]+\.nar(\.(xz|zst|bz2|br))?$/;
 
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 
@@ -34,7 +74,8 @@ const CACHE_PUT_BYTE_LIMIT = 50 * 1024 * 1024; // 50 MB; conservative
 let publicKeyCache: { keyName: string; key: CryptoKey } | null = null;
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    const context = ctx ?? ({ waitUntil: () => {} } as unknown as ExecutionContext);
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -55,22 +96,51 @@ export default {
       });
     }
 
-    const method = request.method;
-    if (method === "GET" || method === "HEAD") return handleRead(request, env, ctx);
-    if (method === "PUT") return handleUpload(request, env);
+    if (path === "/metrics") {
+      const authErr = bearerAuth(request, env);
+      if (authErr) {
+        context.waitUntil(incMetric(env.METRICS, "auth_fail"));
+        return authErr;
+      }
 
-    return new Response("Method not allowed", {
+      const keys: MetricKey[] = ["get_hit", "get_miss", "put_ok", "auth_fail"];
+      const metrics: Record<string, number> = {};
+      for (const k of keys) {
+        metrics[k] = parseInt((await env.METRICS?.get(k)) || "0", 10);
+      }
+      metrics.get_total = metrics.get_hit + metrics.get_miss;
+
+      return new Response(JSON.stringify(metrics, null, 2), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const method = request.method;
+    if (method === "GET" || method === "HEAD") {
+      const response = await handleRead(request, env, context);
+      if (response.status === 200 || response.status === 206 || response.status === 304) {
+        context.waitUntil(incMetric(env.METRICS, "get_hit"));
+      } else if (response.status === 404) {
+        context.waitUntil(incMetric(env.METRICS, "get_miss"));
+      }
+      return response;
+    }
+
+    if (method === "PUT") {
+      return handleUpload(request, env, context);
+    }
+
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
       status: 405,
-      headers: { Allow: "GET, HEAD, PUT" },
+      headers: {
+        "Content-Type": "application/json",
+        Allow: "GET, HEAD, PUT",
+      },
     });
   },
 };
 
-async function handleRead(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-): Promise<Response> {
+async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const objectName = url.pathname.slice(1);
 
@@ -87,9 +157,7 @@ async function handleRead(
     // can't use HEAD as a freshness probe — they have to issue a GET and
     // discard the body.
     const headIfNoneMatch = request.headers.get("if-none-match");
-    const headConditionalEtag = headIfNoneMatch
-      ? normalizeEtag(headIfNoneMatch)
-      : undefined;
+    const headConditionalEtag = headIfNoneMatch ? normalizeEtag(headIfNoneMatch) : undefined;
 
     const cacheKey = new Request(url.toString(), { method: "GET" });
     const cached = await caches.default.match(cacheKey);
@@ -155,8 +223,7 @@ async function handleRead(
   // cache miss. Warm cache hits stay on the edge path; the conditional
   // comparison is handled from the cached response headers.
   const ifNoneMatch = request.headers.get("if-none-match");
-  const conditionalEtag =
-    parsedRange === null && ifNoneMatch ? normalizeEtag(ifNoneMatch) : undefined;
+  const conditionalEtag = parsedRange === null && ifNoneMatch ? normalizeEtag(ifNoneMatch) : undefined;
   if (conditionalEtag) {
     r2Opts.onlyIf = { etagDoesNotMatch: conditionalEtag };
   }
@@ -208,10 +275,7 @@ async function handleRead(
     if (outcome.kind === "unsatisfiable") {
       return rangeNotSatisfiable(object.size);
     }
-    headers.set(
-      "Content-Range",
-      `bytes ${outcome.start}-${outcome.start + outcome.length - 1}/${object.size}`,
-    );
+    headers.set("Content-Range", `bytes ${outcome.start}-${outcome.start + outcome.length - 1}/${object.size}`);
     headers.set("Content-Length", String(outcome.length));
     status = 206;
   } else {
@@ -231,16 +295,12 @@ async function handleRead(
   // Path A (R2 Custom Domain for /nar/*) is the longer-term fix for (1).
   if (status === 200) {
     if (object.size >= CACHE_PUT_BYTE_LIMIT) {
-      console.log(
-        `cache.put skipped for ${objectName} (size=${object.size} >= limit=${CACHE_PUT_BYTE_LIMIT})`,
-      );
+      console.log(`cache.put skipped for ${objectName} (size=${object.size} >= limit=${CACHE_PUT_BYTE_LIMIT})`);
     } else {
       ctx.waitUntil(
         cache.put(cacheKey, response.clone()).catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err);
-          console.error(
-            `cache.put failed for ${objectName} (size=${object.size}): ${message}`,
-          );
+          console.error(`cache.put failed for ${objectName} (size=${object.size}): ${message}`);
         }),
       );
     }
@@ -249,14 +309,11 @@ async function handleRead(
   return response;
 }
 
-async function handleUpload(request: Request, env: Env): Promise<Response> {
-  if (!env.UPLOAD_TOKEN) {
-    return new Response("Uploads disabled", { status: 503 });
-  }
-
-  const provided = extractAuthToken(request.headers.get("authorization"));
-  if (!provided || !constantTimeEqual(provided, env.UPLOAD_TOKEN)) {
-    return new Response("Unauthorized", { status: 401 });
+async function handleUpload(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const authErr = bearerAuth(request, env);
+  if (authErr) {
+    ctx.waitUntil(incMetric(env.METRICS, "auth_fail"));
+    return authErr;
   }
 
   const url = new URL(request.url);
@@ -284,22 +341,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     await env.BUCKET.put(objectName, request.body, { httpMetadata });
   }
 
+  ctx.waitUntil(incMetric(env.METRICS, "put_ok"));
   return new Response("OK", { status: 201 });
-}
-
-function extractAuthToken(authHeader: string | null): string {
-  if (!authHeader) return "";
-  if (authHeader.startsWith("Bearer ")) return authHeader.slice(7).trim();
-  if (authHeader.startsWith("Basic ")) {
-    try {
-      const decoded = atob(authHeader.slice(6).trim());
-      const colonIdx = decoded.indexOf(":");
-      return colonIdx === -1 ? "" : decoded.slice(colonIdx + 1);
-    } catch {
-      return "";
-    }
-  }
-  return "";
 }
 
 function isValidPath(p: string): boolean {
@@ -376,9 +419,7 @@ export function parseRangeHeader(header: string | null): ParsedRange | null {
  * `resolveRange` accepts this narrowed type so the unsatisfiable detection
  * is purely about size, not syntax.
  */
-export type RangeRequest =
-  | { kind: "prefix"; offset: number; length?: number }
-  | { kind: "suffix"; length: number };
+export type RangeRequest = { kind: "prefix"; offset: number; length?: number } | { kind: "suffix"; length: number };
 
 /**
  * Result of intersecting a parsed range with the object's actual size.
@@ -395,9 +436,7 @@ export type RangeRequest =
  * per RFC 9110 §14.1.2. For suffix ranges where N >= size, the whole object
  * is served.
  */
-export type RangeOutcome =
-  | { kind: "satisfied"; start: number; length: number }
-  | { kind: "unsatisfiable" };
+export type RangeOutcome = { kind: "satisfied"; start: number; length: number } | { kind: "unsatisfiable" };
 
 export function resolveRange(req: RangeRequest, objectSize: number): RangeOutcome {
   // RFC 9110 §14.1.2: a byte-range-set is satisfiable iff at least one spec
@@ -406,10 +445,7 @@ export function resolveRange(req: RangeRequest, objectSize: number): RangeOutcom
 
   if (req.kind === "prefix") {
     if (req.offset >= objectSize) return { kind: "unsatisfiable" };
-    const end =
-      req.length !== undefined
-        ? Math.min(req.offset + req.length - 1, objectSize - 1)
-        : objectSize - 1;
+    const end = req.length !== undefined ? Math.min(req.offset + req.length - 1, objectSize - 1) : objectSize - 1;
     return { kind: "satisfied", start: req.offset, length: end - req.offset + 1 };
   }
   // suffix
@@ -474,13 +510,7 @@ async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolea
       return false;
     }
     if (raw.length !== 32) return false;
-    const key = await crypto.subtle.importKey(
-      "raw",
-      raw,
-      { name: "Ed25519" },
-      false,
-      ["verify"],
-    );
+    const key = await crypto.subtle.importKey("raw", raw, { name: "Ed25519" }, false, ["verify"]);
     publicKeyCache = { keyName, key };
   }
 
@@ -514,12 +544,7 @@ async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolea
     } catch {
       continue;
     }
-    const ok = await crypto.subtle.verify(
-      { name: "Ed25519" },
-      publicKeyCache.key,
-      sigBytes,
-      fingerprintBytes,
-    );
+    const ok = await crypto.subtle.verify({ name: "Ed25519" }, publicKeyCache.key, sigBytes, fingerprintBytes);
     if (ok) return true;
   }
   return false;
