@@ -82,14 +82,46 @@ async function handleRead(
   // return a body-less 200 with the cached headers. This avoids a round-trip
   // to R2 for already-warmed hashes.
   if (request.method === "HEAD") {
+    // RFC 9110 §13.1.2: a conditional HEAD with `If-None-Match` matching the
+    // current representation MUST respond 304, not 200. Without this, clients
+    // can't use HEAD as a freshness probe — they have to issue a GET and
+    // discard the body.
+    const headIfNoneMatch = request.headers.get("if-none-match");
+    const headConditionalEtag = headIfNoneMatch
+      ? normalizeEtag(headIfNoneMatch)
+      : undefined;
+
     const cacheKey = new Request(url.toString(), { method: "GET" });
     const cached = await caches.default.match(cacheKey);
     if (cached) {
+      if (headConditionalEtag) {
+        const cachedEtag = normalizeEtag(cached.headers.get("etag") ?? "");
+        if (cachedEtag === headConditionalEtag) {
+          return new Response(null, {
+            status: 304,
+            headers: {
+              etag: cached.headers.get("etag") ?? headConditionalEtag,
+              "Cache-Control": IMMUTABLE_CACHE,
+            },
+          });
+        }
+      }
       return new Response(null, { status: 200, headers: cached.headers });
     }
 
     const head = await env.BUCKET.head(objectName);
     if (!head) return new Response(null, { status: 404 });
+
+    if (headConditionalEtag && normalizeEtag(head.httpEtag) === headConditionalEtag) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          etag: head.httpEtag,
+          "Cache-Control": IMMUTABLE_CACHE,
+        },
+      });
+    }
+
     const headers = new Headers();
     head.writeHttpMetadata(headers);
     headers.set("etag", head.httpEtag);
