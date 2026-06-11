@@ -431,7 +431,9 @@ export function parseRangeHeader(header: string | null): ParsedRange | null {
     if (!single[2]) return { kind: "prefix", offset };
     const end = parseInt(single[2], 10);
     if (!safe(end) || end < offset) return { kind: "invalid" };
-    return { kind: "prefix", offset, length: end - offset + 1 };
+    const length = end - offset + 1;
+    if (!safe(length)) return { kind: "invalid" };
+    return { kind: "prefix", offset, length };
   }
 
   return null; // unrecognised — caller treats as no Range
@@ -521,6 +523,36 @@ function constantTimeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
+/**
+ * Parse narinfo text into scalar fields + signatures.
+ *
+ * Non-`Sig` fields must appear at most once. Nix libstore uses LAST-WINS for
+ * some duplicates (StorePath/NarHash/NarSize) but errors on others
+ * (References/CA). We reject all duplicate non-`Sig` keys at upload time so
+ * the verifier fingerprint cannot diverge from what a Nix client interprets
+ * from the same bytes. `Sig` remains multi-valued.
+ */
+export function parseNarinfoFields(
+  text: string,
+): { ok: true; fields: Record<string, string>; sigs: string[] } | { ok: false } {
+  const fields: Record<string, string> = {};
+  const sigs: string[] = [];
+  for (const line of text.split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    const k = line.slice(0, idx).trim();
+    const v = line.slice(idx + 1).trim();
+    if (k === "Sig") {
+      sigs.push(v);
+    } else if (k in fields) {
+      return { ok: false };
+    } else {
+      fields[k] = v;
+    }
+  }
+  return { ok: true, fields, sigs };
+}
+
 async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolean> {
   if (!publicKeyCache) {
     const colonIdx = nixPublicKey.indexOf(":");
@@ -537,23 +569,9 @@ async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolea
     publicKeyCache = { keyName, key };
   }
 
-  // Parse with FIRST-WINS for non-Sig fields. A malicious uploader could
-  // include duplicate keys (e.g. two `StorePath:` lines): if the verifier
-  // signed over the LAST occurrence but a downstream Nix client reads the
-  // FIRST, the signature would verify against content the client never
-  // sees. Nix's own narinfo parser (libstore) takes the first occurrence
-  // of each non-`Sig` field, so we match that. `Sig` is intentionally
-  // multi-valued (one narinfo can carry signatures from multiple keys).
-  const fields: Record<string, string> = {};
-  const sigs: string[] = [];
-  for (const line of text.split("\n")) {
-    const idx = line.indexOf(":");
-    if (idx === -1) continue;
-    const k = line.slice(0, idx).trim();
-    const v = line.slice(idx + 1).trim();
-    if (k === "Sig") sigs.push(v);
-    else if (!(k in fields)) fields[k] = v;
-  }
+  const parsed = parseNarinfoFields(text);
+  if (!parsed.ok) return false;
+  const { fields, sigs } = parsed;
 
   const refs = (fields["References"] ?? "")
     .split(/\s+/)
