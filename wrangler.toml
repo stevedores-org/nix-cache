@@ -14,7 +14,17 @@ enabled = true
 binding = "BUCKET"
 bucket_name = "nix-cache"
 
+# Optional KV namespace for hit/miss/put/auth counters surfaced at GET /metrics.
+# Provision once with `wrangler kv namespace create nix-cache-metrics`, then
+# uncomment and paste the returned id. With the binding absent, all metric
+# increments are no-ops and /metrics returns 503 (because UPLOAD_TOKEN gates
+# it). The counters are best-effort — KV writes are eventually consistent and
+# failures are logged but never propagated to the client request.
+# [[kv_namespaces]]
+# binding = "METRICS"
+# id      = "REPLACE_ME"
+
 # Secrets (set via `wrangler secret put`):
-#   UPLOAD_TOKEN     — required to enable PUT uploads
+#   UPLOAD_TOKEN     — required to enable PUT uploads and to authenticate /metrics reads
 #   NIX_PUBLIC_KEY   — optional; when set, narinfo uploads must carry a valid Ed25519 signature
 #                      (format: "keyname:base64-32-byte-pubkey")
