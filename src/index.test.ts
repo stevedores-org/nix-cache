@@ -399,6 +399,21 @@ describe("nix-cache worker", () => {
       expect(res.status).toBe(401);
     });
 
+    it("sets Cache-Control no-store on metrics", async () => {
+      const res = await worker.fetch(
+        new Request("https://nix-cache.stevedores.org/metrics", {
+          headers: { Authorization: "Bearer test-secret-token" },
+        }),
+        env,
+      );
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+    });
+
+    it("sets Cache-Control no-store on health", async () => {
+      const res = await worker.fetch(new Request("https://nix-cache.stevedores.org/health"), env);
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+    });
+
     it("returns counters after activity", async () => {
       // Generate some activity: 1 hit, 1 miss, 1 put, 1 auth fail
       await worker.fetch(new Request("https://nix-cache.stevedores.org/miss.narinfo"), env);

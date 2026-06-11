@@ -71,6 +71,18 @@ describe("parseRangeHeader", () => {
       length: 1,
     });
   });
+
+  test("oversized digit strings are invalid (safe-integer guard)", () => {
+    const huge = "9".repeat(20);
+    expect(parseRangeHeader(`bytes=${huge}-${huge}`)).toEqual({ kind: "invalid" });
+    expect(parseRangeHeader(`bytes=-${huge}`)).toEqual({ kind: "invalid" });
+    expect(parseRangeHeader(`bytes=${huge}-`)).toEqual({ kind: "invalid" });
+  });
+
+  test("computed length past MAX_SAFE_INTEGER is invalid", () => {
+    const max = Number.MAX_SAFE_INTEGER;
+    expect(parseRangeHeader(`bytes=0-${max}`)).toEqual({ kind: "invalid" });
+  });
 });
 
 describe("resolveRange", () => {

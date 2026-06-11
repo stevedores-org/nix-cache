@@ -89,11 +89,16 @@ export default {
     }
 
     if (path === "/health") {
-      return Response.json({
-        status: "ok",
-        cache: "nix-cache",
-        timestamp: new Date().toISOString(),
-      });
+      return Response.json(
+        {
+          status: "ok",
+          cache: "nix-cache",
+          timestamp: new Date().toISOString(),
+        },
+        // `timestamp` changes every request; intermediates must not serve
+        // a stale snapshot as a "live" health check.
+        { headers: { "Cache-Control": "no-store" } },
+      );
     }
 
     if (path === "/metrics") {
@@ -111,14 +116,25 @@ export default {
       metrics.get_total = metrics.get_hit + metrics.get_miss;
 
       return new Response(JSON.stringify(metrics, null, 2), {
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          // Counters mutate on every cache request; intermediates must not
+          // serve a stale snapshot. Without this, a CDN edge could pin
+          // numbers for an operator's dashboard.
+          "Cache-Control": "no-store",
+        },
       });
     }
 
     const method = request.method;
     if (method === "GET" || method === "HEAD") {
       const response = await handleRead(request, env, context);
-      if (response.status === 200 || response.status === 206 || response.status === 304) {
+      // Classification: the resource existing in R2 is a hit (200/206/304/416
+      // — 416 means the object was there but the requested byte range was
+      // not satisfiable, which is a client-side range error, not a miss).
+      // 404 is the only true miss. Other statuses (e.g. 5xx) are not
+      // request-outcome events and are deliberately not counted.
+      if (response.status === 200 || response.status === 206 || response.status === 304 || response.status === 416) {
         context.waitUntil(incMetric(env.METRICS, "get_hit"));
       } else if (response.status === 404) {
         context.waitUntil(incMetric(env.METRICS, "get_miss"));
@@ -396,19 +412,28 @@ export function parseRangeHeader(header: string | null): ParsedRange | null {
     return { kind: "invalid" };
   }
 
+  // `parseInt` on a digit string longer than ~16 chars produces a value past
+  // Number.MAX_SAFE_INTEGER, at which point arithmetic (`end - offset + 1`)
+  // silently loses precision. Treat that as a malformed range so callers
+  // get a deterministic 416 instead of a quietly-wrong Content-Length.
+  const safe = (n: number): boolean => Number.isSafeInteger(n) && n >= 0;
+
   const suffix = /^bytes=-(\d+)$/.exec(header);
   if (suffix) {
     const length = parseInt(suffix[1], 10);
-    return length > 0 ? { kind: "suffix", length } : { kind: "invalid" };
+    return length > 0 && safe(length) ? { kind: "suffix", length } : { kind: "invalid" };
   }
 
   const single = /^bytes=(\d+)-(\d*)$/.exec(header);
   if (single) {
     const offset = parseInt(single[1], 10);
+    if (!safe(offset)) return { kind: "invalid" };
     if (!single[2]) return { kind: "prefix", offset };
     const end = parseInt(single[2], 10);
-    if (end < offset) return { kind: "invalid" };
-    return { kind: "prefix", offset, length: end - offset + 1 };
+    if (!safe(end) || end < offset) return { kind: "invalid" };
+    const length = end - offset + 1;
+    if (!safe(length)) return { kind: "invalid" };
+    return { kind: "prefix", offset, length };
   }
 
   return null; // unrecognised — caller treats as no Range
@@ -498,6 +523,36 @@ function constantTimeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
+/**
+ * Parse narinfo text into scalar fields + signatures.
+ *
+ * Non-`Sig` fields must appear at most once. Nix libstore uses LAST-WINS for
+ * some duplicates (StorePath/NarHash/NarSize) but errors on others
+ * (References/CA). We reject all duplicate non-`Sig` keys at upload time so
+ * the verifier fingerprint cannot diverge from what a Nix client interprets
+ * from the same bytes. `Sig` remains multi-valued.
+ */
+export function parseNarinfoFields(
+  text: string,
+): { ok: true; fields: Record<string, string>; sigs: string[] } | { ok: false } {
+  const fields: Record<string, string> = {};
+  const sigs: string[] = [];
+  for (const line of text.split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    const k = line.slice(0, idx).trim();
+    const v = line.slice(idx + 1).trim();
+    if (k === "Sig") {
+      sigs.push(v);
+    } else if (k in fields) {
+      return { ok: false };
+    } else {
+      fields[k] = v;
+    }
+  }
+  return { ok: true, fields, sigs };
+}
+
 async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolean> {
   if (!publicKeyCache) {
     const colonIdx = nixPublicKey.indexOf(":");
@@ -514,16 +569,9 @@ async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolea
     publicKeyCache = { keyName, key };
   }
 
-  const fields: Record<string, string> = {};
-  const sigs: string[] = [];
-  for (const line of text.split("\n")) {
-    const idx = line.indexOf(":");
-    if (idx === -1) continue;
-    const k = line.slice(0, idx).trim();
-    const v = line.slice(idx + 1).trim();
-    if (k === "Sig") sigs.push(v);
-    else fields[k] = v;
-  }
+  const parsed = parseNarinfoFields(text);
+  if (!parsed.ok) return false;
+  const { fields, sigs } = parsed;
 
   const refs = (fields["References"] ?? "")
     .split(/\s+/)
