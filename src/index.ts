@@ -3,44 +3,61 @@
  *
  * Implements a Nix-compatible binary cache backed by Cloudflare R2.
  * Serves .narinfo and .nar files with edge caching, range requests,
- * Ed25519 signature verification on uploads, and constant-time
- * token auth. Optional KV-backed counters surface at /metrics
- * (gated by UPLOAD_TOKEN).
+ * Ed25519 signature verification on uploads, constant-time token auth,
+ * and Cloudflare KV-backed metrics.
+ * GET is public (serves .narinfo and .nar files).
+ * PUT requires Bearer token authentication.
+ * /metrics returns JSON counters (authenticated).
  */
 
 export interface Env {
   BUCKET: R2Bucket;
   UPLOAD_TOKEN?: string;
+  CACHE_AUTH_TOKEN?: string;
   NIX_PUBLIC_KEY?: string;
-  // Optional KV binding for hit/miss/put/auth counters. When unset, all
-  // metric increments are no-ops and /metrics returns zeros. Operators
-  // who don't want counters can simply not provision the namespace.
   METRICS?: KVNamespace;
 }
 
 type MetricKey = "get_hit" | "get_miss" | "put_ok" | "auth_fail";
-const METRIC_KEYS: readonly MetricKey[] = ["get_hit", "get_miss", "put_ok", "auth_fail"];
 
-// Counter increment is best-effort and non-atomic — KV `get` then `put` races
-// across concurrent requests. We accept under-counting (bounded by request
-// concurrency) for cache-observability use; this is not for billing. Use
-// Workers Analytics Engine or a Durable Object if exact counts matter.
 async function incMetric(kv: KVNamespace | undefined, key: MetricKey): Promise<void> {
   if (!kv) return;
-  try {
-    const val = parseInt((await kv.get(key)) ?? "0", 10);
-    await kv.put(key, String(val + 1));
-  } catch (err: unknown) {
-    // Don't let metric failures break request handling.
-    console.error(`incMetric(${key}) failed: ${err instanceof Error ? err.message : String(err)}`);
+  const val = parseInt((await kv.get(key)) || "0", 10);
+  await kv.put(key, String(val + 1));
+}
+
+function jsonError(message: string, status: number): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function bearerAuth(request: Request, env: Env): Response | null {
+  const token = env.CACHE_AUTH_TOKEN || env.UPLOAD_TOKEN;
+  if (!token) {
+    return jsonError("Server misconfigured: no auth token set", 500);
   }
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader) {
+    return jsonError("Missing Authorization header", 401);
+  }
+  const parts = authHeader.split(" ");
+  if (parts.length !== 2 || parts[0] !== "Bearer" || !parts[1]) {
+    return jsonError("Authorization must use Bearer scheme", 401);
+  }
+  const provided = parts[1];
+  if (!constantTimeEqual(provided, token)) {
+    return jsonError("Invalid token", 403);
+  }
+  return null;
 }
 
 const NIX_CACHE_INFO = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
 
 // Hash-named paths only — keeps the bucket clean and prevents path injection.
-const NARINFO_RE = /^[0-9a-z]{32}\.narinfo$/;
-const NAR_RE = /^nar\/[0-9a-z]{52}(-[0-9a-z+._-]+)?\.nar(\.(xz|zst|bz2|br))?$/;
+const NARINFO_RE = /^(?:[a-zA-Z0-9._-]+\/)?[a-zA-Z0-9._-]+\.narinfo$/;
+const NAR_RE = /^(?:[a-zA-Z0-9._-]+\/)?nar\/[a-zA-Z0-9._-]+\.nar(\.(xz|zst|bz2|br))?$/;
 
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 
@@ -57,7 +74,8 @@ const CACHE_PUT_BYTE_LIMIT = 50 * 1024 * 1024; // 50 MB; conservative
 let publicKeyCache: { keyName: string; key: CryptoKey } | null = null;
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    const context = ctx ?? ({ waitUntil: () => {} } as unknown as ExecutionContext);
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -71,41 +89,69 @@ export default {
     }
 
     if (path === "/health") {
-      return Response.json({
-        status: "ok",
-        cache: "nix-cache",
-        timestamp: new Date().toISOString(),
-      });
+      return Response.json(
+        {
+          status: "ok",
+          cache: "nix-cache",
+          timestamp: new Date().toISOString(),
+        },
+        // `timestamp` changes every request; intermediates must not serve
+        // a stale snapshot as a "live" health check.
+        { headers: { "Cache-Control": "no-store" } },
+      );
     }
 
     if (path === "/metrics") {
-      // Reuses UPLOAD_TOKEN — both write paths and the observability surface
-      // belong to the deploy operator. Treating these as the same auth
-      // boundary avoids juggling a second secret. If you do want them split,
-      // add a METRICS_TOKEN env and gate the bearer check on that instead.
-      if (!env.UPLOAD_TOKEN) {
-        return new Response("Metrics disabled", { status: 503 });
+      const authErr = bearerAuth(request, env);
+      if (authErr) {
+        context.waitUntil(incMetric(env.METRICS, "auth_fail"));
+        return authErr;
       }
-      const provided = extractAuthToken(request.headers.get("authorization"));
-      if (!provided || !constantTimeEqual(provided, env.UPLOAD_TOKEN)) {
-        ctx.waitUntil(incMetric(env.METRICS, "auth_fail"));
-        return new Response("Unauthorized", { status: 401 });
+
+      const keys: MetricKey[] = ["get_hit", "get_miss", "put_ok", "auth_fail"];
+      const metrics: Record<string, number> = {};
+      for (const k of keys) {
+        metrics[k] = parseInt((await env.METRICS?.get(k)) || "0", 10);
       }
-      const counters: Record<string, number> = {};
-      for (const key of METRIC_KEYS) {
-        counters[key] = parseInt((await env.METRICS?.get(key)) ?? "0", 10);
-      }
-      counters.get_total = counters.get_hit + counters.get_miss;
-      return Response.json(counters);
+      metrics.get_total = metrics.get_hit + metrics.get_miss;
+
+      return new Response(JSON.stringify(metrics, null, 2), {
+        headers: {
+          "Content-Type": "application/json",
+          // Counters mutate on every cache request; intermediates must not
+          // serve a stale snapshot. Without this, a CDN edge could pin
+          // numbers for an operator's dashboard.
+          "Cache-Control": "no-store",
+        },
+      });
     }
 
     const method = request.method;
-    if (method === "GET" || method === "HEAD") return handleRead(request, env, ctx);
-    if (method === "PUT") return handleUpload(request, env, ctx);
+    if (method === "GET" || method === "HEAD") {
+      const response = await handleRead(request, env, context);
+      // Classification: the resource existing in R2 is a hit (200/206/304/416
+      // — 416 means the object was there but the requested byte range was
+      // not satisfiable, which is a client-side range error, not a miss).
+      // 404 is the only true miss. Other statuses (e.g. 5xx) are not
+      // request-outcome events and are deliberately not counted.
+      if (response.status === 200 || response.status === 206 || response.status === 304 || response.status === 416) {
+        context.waitUntil(incMetric(env.METRICS, "get_hit"));
+      } else if (response.status === 404) {
+        context.waitUntil(incMetric(env.METRICS, "get_miss"));
+      }
+      return response;
+    }
 
-    return new Response("Method not allowed", {
+    if (method === "PUT") {
+      return handleUpload(request, env, context);
+    }
+
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
       status: 405,
-      headers: { Allow: "GET, HEAD, PUT" },
+      headers: {
+        "Content-Type": "application/json",
+        Allow: "GET, HEAD, PUT",
+      },
     });
   },
 };
@@ -115,7 +161,6 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
   const objectName = url.pathname.slice(1);
 
   if (!isValidPath(objectName)) {
-    ctx.waitUntil(incMetric(env.METRICS, "get_miss"));
     return new Response("Not found", { status: 404 });
   }
 
@@ -136,7 +181,6 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
       if (headConditionalEtag) {
         const cachedEtag = normalizeEtag(cached.headers.get("etag") ?? "");
         if (cachedEtag === headConditionalEtag) {
-          ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
           return new Response(null, {
             status: 304,
             headers: {
@@ -146,18 +190,13 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
           });
         }
       }
-      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return new Response(null, { status: 200, headers: cached.headers });
     }
 
     const head = await env.BUCKET.head(objectName);
-    if (!head) {
-      ctx.waitUntil(incMetric(env.METRICS, "get_miss"));
-      return new Response(null, { status: 404 });
-    }
+    if (!head) return new Response(null, { status: 404 });
 
     if (headConditionalEtag && normalizeEtag(head.httpEtag) === headConditionalEtag) {
-      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return new Response(null, {
         status: 304,
         headers: {
@@ -174,7 +213,6 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
     headers.set("Cache-Control", IMMUTABLE_CACHE);
     headers.set("Content-Length", String(head.size));
     headers.set("Accept-Ranges", "bytes");
-    ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
     return new Response(null, { status: 200, headers });
   }
 
@@ -212,7 +250,6 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
   if (parsedRange === null) {
     const cached = await cache.match(cacheKey);
     if (cached) {
-      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return respondFromCache(cached, conditionalEtag);
     }
   }
@@ -225,7 +262,6 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
     if (head) {
       // Path 1: Conditional GET matched (304).
       if (conditionalEtag && head.httpEtag === conditionalEtag) {
-        ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
         return new Response(null, {
           status: 304,
           headers: {
@@ -236,11 +272,9 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
       }
       // Path 2: Range request was out of bounds (416).
       if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
-        ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
         return rangeNotSatisfiable(head.size);
       }
     }
-    ctx.waitUntil(incMetric(env.METRICS, "get_miss"));
     return new Response("Not found", { status: 404 });
   }
 
@@ -255,7 +289,6 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
   if (parsedRange?.kind === "prefix" || parsedRange?.kind === "suffix") {
     const outcome = resolveRange(parsedRange, object.size);
     if (outcome.kind === "unsatisfiable") {
-      ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
       return rangeNotSatisfiable(object.size);
     }
     headers.set("Content-Range", `bytes ${outcome.start}-${outcome.start + outcome.length - 1}/${object.size}`);
@@ -266,7 +299,6 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
   }
 
   const response = new Response(object.body, { status, headers });
-  ctx.waitUntil(incMetric(env.METRICS, "get_hit"));
 
   // Only cache full 200 responses — partials would pollute the edge cache.
   // Two failure modes, two defences:
@@ -294,14 +326,10 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
 }
 
 async function handleUpload(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  if (!env.UPLOAD_TOKEN) {
-    return new Response("Uploads disabled", { status: 503 });
-  }
-
-  const provided = extractAuthToken(request.headers.get("authorization"));
-  if (!provided || !constantTimeEqual(provided, env.UPLOAD_TOKEN)) {
+  const authErr = bearerAuth(request, env);
+  if (authErr) {
     ctx.waitUntil(incMetric(env.METRICS, "auth_fail"));
-    return new Response("Unauthorized", { status: 401 });
+    return authErr;
   }
 
   const url = new URL(request.url);
@@ -331,21 +359,6 @@ async function handleUpload(request: Request, env: Env, ctx: ExecutionContext): 
 
   ctx.waitUntil(incMetric(env.METRICS, "put_ok"));
   return new Response("OK", { status: 201 });
-}
-
-function extractAuthToken(authHeader: string | null): string {
-  if (!authHeader) return "";
-  if (authHeader.startsWith("Bearer ")) return authHeader.slice(7).trim();
-  if (authHeader.startsWith("Basic ")) {
-    try {
-      const decoded = atob(authHeader.slice(6).trim());
-      const colonIdx = decoded.indexOf(":");
-      return colonIdx === -1 ? "" : decoded.slice(colonIdx + 1);
-    } catch {
-      return "";
-    }
-  }
-  return "";
 }
 
 function isValidPath(p: string): boolean {
@@ -399,19 +412,28 @@ export function parseRangeHeader(header: string | null): ParsedRange | null {
     return { kind: "invalid" };
   }
 
+  // `parseInt` on a digit string longer than ~16 chars produces a value past
+  // Number.MAX_SAFE_INTEGER, at which point arithmetic (`end - offset + 1`)
+  // silently loses precision. Treat that as a malformed range so callers
+  // get a deterministic 416 instead of a quietly-wrong Content-Length.
+  const safe = (n: number): boolean => Number.isSafeInteger(n) && n >= 0;
+
   const suffix = /^bytes=-(\d+)$/.exec(header);
   if (suffix) {
     const length = parseInt(suffix[1], 10);
-    return length > 0 ? { kind: "suffix", length } : { kind: "invalid" };
+    return length > 0 && safe(length) ? { kind: "suffix", length } : { kind: "invalid" };
   }
 
   const single = /^bytes=(\d+)-(\d*)$/.exec(header);
   if (single) {
     const offset = parseInt(single[1], 10);
+    if (!safe(offset)) return { kind: "invalid" };
     if (!single[2]) return { kind: "prefix", offset };
     const end = parseInt(single[2], 10);
-    if (end < offset) return { kind: "invalid" };
-    return { kind: "prefix", offset, length: end - offset + 1 };
+    if (!safe(end) || end < offset) return { kind: "invalid" };
+    const length = end - offset + 1;
+    if (!safe(length)) return { kind: "invalid" };
+    return { kind: "prefix", offset, length };
   }
 
   return null; // unrecognised — caller treats as no Range
@@ -501,6 +523,36 @@ function constantTimeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
+/**
+ * Parse narinfo text into scalar fields + signatures.
+ *
+ * Non-`Sig` fields must appear at most once. Nix libstore uses LAST-WINS for
+ * some duplicates (StorePath/NarHash/NarSize) but errors on others
+ * (References/CA). We reject all duplicate non-`Sig` keys at upload time so
+ * the verifier fingerprint cannot diverge from what a Nix client interprets
+ * from the same bytes. `Sig` remains multi-valued.
+ */
+export function parseNarinfoFields(
+  text: string,
+): { ok: true; fields: Record<string, string>; sigs: string[] } | { ok: false } {
+  const fields: Record<string, string> = {};
+  const sigs: string[] = [];
+  for (const line of text.split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    const k = line.slice(0, idx).trim();
+    const v = line.slice(idx + 1).trim();
+    if (k === "Sig") {
+      sigs.push(v);
+    } else if (k in fields) {
+      return { ok: false };
+    } else {
+      fields[k] = v;
+    }
+  }
+  return { ok: true, fields, sigs };
+}
+
 async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolean> {
   if (!publicKeyCache) {
     const colonIdx = nixPublicKey.indexOf(":");
@@ -517,16 +569,9 @@ async function verifyNarinfo(text: string, nixPublicKey: string): Promise<boolea
     publicKeyCache = { keyName, key };
   }
 
-  const fields: Record<string, string> = {};
-  const sigs: string[] = [];
-  for (const line of text.split("\n")) {
-    const idx = line.indexOf(":");
-    if (idx === -1) continue;
-    const k = line.slice(0, idx).trim();
-    const v = line.slice(idx + 1).trim();
-    if (k === "Sig") sigs.push(v);
-    else fields[k] = v;
-  }
+  const parsed = parseNarinfoFields(text);
+  if (!parsed.ok) return false;
+  const { fields, sigs } = parsed;
 
   const refs = (fields["References"] ?? "")
     .split(/\s+/)

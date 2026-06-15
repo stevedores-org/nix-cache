@@ -1,30 +1,49 @@
 name = "nix-cache"
 main = "src/index.ts"
-compatibility_date = "2026-01-15"
+compatibility_date = "2026-02-22"
 account_id = "f1be33af27cf878e2e81cb29a0d886f7"
+workers_dev = true
 
 [[routes]]
 pattern = "nix-cache.stevedores.org/*"
 zone_name = "stevedores.org"
 
+# NOTE: Cloudflare Workers Builds (GitHub integration) does NOT honor this
+# [build] section. The build command must be set in the CF dashboard:
+#   Settings > Build > Build command: bun install && bunx tsc --noEmit
+#   Settings > Build > Deploy command: bunx wrangler@3 deploy
+[build]
+command = "bun install && bunx tsc --noEmit"
+
+# deploy: bunx wrangler@3 deploy
+# dev:    bunx wrangler@3 dev
+
+# ── Observability ────────────────────────────────────────────────
 [observability]
 enabled = true
 
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ── Environment variables ────────────────────────────────────────
+[vars]
+APP_ENV = "production"
+SERVICE_NAME = "nix-cache"
+NIX_PUBLIC_KEY = "stevedores-cache-1:bXLxkipycRWproIJnk8pPWNFdgVfeV+I2mJXCoW4/ag="
+# Secrets (set via `wrangler secret put` or CF dashboard):
+#   CACHE_AUTH_TOKEN        — bearer token required for PUT uploads
+#   NIX_SIGNING_SECRET_KEY  — Ed25519 secret key for signing narinfo (org-level GH secret)
+
+# ── KV: metrics counters ─────────────────────────────────────────
+# Create namespace: bunx wrangler kv namespace create METRICS
+# The id below must be updated after creation.
+[[kv_namespaces]]
+binding = "METRICS"
+id = "3c8a120b5544498986a497e7da47b1ea"
+
+# ── R2: Nix binary cache storage (.narinfo, .nar) ───────────────
+# Create bucket: wrangler r2 bucket create nix-cache
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "nix-cache"
-
-# Optional KV namespace for hit/miss/put/auth counters surfaced at GET /metrics.
-# Provision once with `wrangler kv namespace create nix-cache-metrics`, then
-# uncomment and paste the returned id. With the binding absent, all metric
-# increments are no-ops and /metrics returns 503 (because UPLOAD_TOKEN gates
-# it). The counters are best-effort — KV writes are eventually consistent and
-# failures are logged but never propagated to the client request.
-# [[kv_namespaces]]
-# binding = "METRICS"
-# id      = "REPLACE_ME"
-
-# Secrets (set via `wrangler secret put`):
-#   UPLOAD_TOKEN     — required to enable PUT uploads and to authenticate /metrics reads
-#   NIX_PUBLIC_KEY   — optional; when set, narinfo uploads must carry a valid Ed25519 signature
-#                      (format: "keyname:base64-32-byte-pubkey")
