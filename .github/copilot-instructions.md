@@ -299,7 +299,6 @@ ai-agent-agent-guides sync --dry-run
 ### Mono-Repo Structure
 
 - `/ai-agents/` - All Rust AI agents (canonical location)
-- `/app-rust/` - Production Rust services (Cloud Run)
 - `/app-go/` - DEPRECATED: Legacy Go code (do not extend)
 - `/app-py/` - DEPRECATED: Legacy Python experiments (maintenance only)
 - `/archive/` - Historical repositories (reference only)
