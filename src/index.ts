@@ -260,8 +260,11 @@ async function handleRead(request: Request, env: Env, ctx: ExecutionContext): Pr
     // OR if the onlyIf condition failed. Disambiguate via HEAD.
     const head = await env.BUCKET.head(objectName);
     if (head) {
-      // Path 1: Conditional GET matched (304).
-      if (conditionalEtag && head.httpEtag === conditionalEtag) {
+      // Path 1: Conditional GET matched (304). `head.httpEtag` is quoted but
+      // `conditionalEtag` is normalized (unquoted), so normalize before
+      // comparing — mirrors the HEAD path above. Without this, a matching
+      // conditional GET fell through to 404 instead of 304.
+      if (conditionalEtag && normalizeEtag(head.httpEtag) === conditionalEtag) {
         return new Response(null, {
           status: 304,
           headers: {
